@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { DEFAULT_INSTRUCTIONS } from "../src/analysis.mjs";
 import { CSS } from "./styles.js";
+import { DeliverySettings } from "./delivery-settings.jsx";
 export const name = "ops-assistant-ui";
 export const inject = ["slots", "connection"];
 const PANEL = "dsh-ops-assistant";
@@ -94,9 +95,8 @@ export function OpsPanel({ call }) {
   const [busy, setBusy] = useState(false);
   const [source, setSource] = useState(null);
   const [task, setTask] = useState(null);
-  const [bots, setBots] = useState([]);
-  const [targets, setTargets] = useState([]);
-  const [botId, setBotId] = useState("");
+  const [deliveryTask, setDeliveryTask] = useState(null);
+  const [dataDir, setDataDir] = useState(null);
   const [tools, setTools] = useState([]);
   const [report, setReport] = useState(null);
   const [raw, setRaw] = useState(null);
@@ -139,14 +139,7 @@ export function OpsPanel({ call }) {
   }
   async function editTask(value) {
     setTask(structuredClone(value ?? freshTask()));
-    setBotId("");
-    setTargets([]);
-    const [b, t] = await Promise.all([
-      call("im.bots", {}),
-      call("tools.list", {}),
-    ]);
-    setBots(b);
-    setTools(t);
+    setTools(await call("tools.list", {}));
   }
   const setTaskField = (key, value) => setTask((t) => ({ ...t, [key]: value }));
   const toggleSource = (id) =>
@@ -274,6 +267,7 @@ export function OpsPanel({ call }) {
           ["tasks", "巡检任务"],
           ["reports", "分析报告"],
           ["deliveries", "IM 投递"],
+          ["storage", "数据存储"],
         ].map(([id, label]) => (
           <button
             key={id}
@@ -485,6 +479,74 @@ export function OpsPanel({ call }) {
       {tab === "deliveries" && (
         <section className="ops-section">
           <div className="ops-section-title">
+            <div>
+              <h2>DSH-IM 投递配置</h2>
+              <p>为每个巡检任务选择渠道、机器人和接收目标。</p>
+            </div>
+          </div>
+          <div className="ops-settings-body">
+            <Field title="选择要配置投递的巡检任务">
+              <select
+                value={deliveryTask?.id ?? ""}
+                disabled={busy}
+                onChange={(e) =>
+                  setDeliveryTask(
+                    structuredClone(
+                      state.config.tasks.find((t) => t.id === e.target.value) ??
+                        null,
+                    ),
+                  )
+                }
+              >
+                <option value="">选择巡检任务</option>
+                {state.config.tasks.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {!state.config.tasks.length && (
+              <Empty>请先在“巡检任务”创建任务，再配置投递渠道。</Empty>
+            )}
+            {deliveryTask && (
+              <>
+                <DeliverySettings
+                  key={deliveryTask.id}
+                  value={deliveryTask}
+                  onChange={setDeliveryTask}
+                  call={call}
+                  im={state.im}
+                  disabled={busy}
+                />
+                <div className="ops-actions" style={{ marginTop: 18 }}>
+                  <Button
+                    primary
+                    disabled={busy}
+                    onClick={async () => {
+                      const updated = await act(
+                        () =>
+                          call("task.delivery.save", {
+                            id: deliveryTask.id,
+                            deliveryMode: deliveryTask.deliveryMode,
+                            targets: deliveryTask.targets,
+                            sendDataOnFailure: deliveryTask.sendDataOnFailure,
+                          }),
+                        "投递配置已保存，对此后新建的巡检批次生效",
+                      );
+                      if (updated) setDeliveryTask(updated);
+                    }}
+                  >
+                    保存投递配置
+                  </Button>
+                  <small>
+                    保存不会发送消息；已有报告保留生成时的接收目标。
+                  </small>
+                </div>
+              </>
+            )}
+          </div>
+          <div className="ops-section-title">
             <h2>IM 投递记录</h2>
             <span className="ops-muted">
               “平台已接受”不代表已读；结果未知时不自动重发。
@@ -504,7 +566,7 @@ export function OpsPanel({ call }) {
                 {state.deliveries.map((d) => (
                   <tr key={d.id}>
                     <td>
-                      <strong>{d.targetId}</strong>
+                      <strong>{d.targetName || d.targetId}</strong>
                       <small>机器人：{d.botId}</small>
                       <small>批次：{d.runId}</small>
                     </td>
@@ -549,6 +611,68 @@ export function OpsPanel({ call }) {
           </div>
         </section>
       )}
+      {tab === "storage" && (
+        <section className="ops-section">
+          <div className="ops-section-title">
+            <div>
+              <h2>数据保存位置</h2>
+              <p>填写运行 DSH 的服务器上的目录，可使用另一块已挂载磁盘。</p>
+            </div>
+          </div>
+          <div className="ops-settings-body">
+            <div className="ops-notice">
+              <strong>当前数据库</strong>
+              <code className="ops-path">
+                {state.storage?.databasePath ?? "正在读取…"}
+              </code>
+              <small>
+                告警原文、分析报告、任务设置、采集快照和 IM 投递记录均保存在此
+                SQLite 数据库。
+              </small>
+            </div>
+            <Field
+              title="数据保存目录"
+              hint="Ubuntu 示例：/data/dsh-ops-assistant。填写目录，不要填写数据库文件名；运行 DSH 的用户需要有读写权限。"
+            >
+              <input
+                value={dataDir ?? state.storage?.dataDir ?? ""}
+                placeholder="/data/dsh-ops-assistant"
+                disabled={busy || !state.storage}
+                onChange={(e) => setDataDir(e.target.value)}
+              />
+            </Field>
+            <Button
+              primary
+              disabled={
+                busy || !state.storage || !(dataDir ?? state.storage?.dataDir)
+              }
+              onClick={() =>
+                act(async () => {
+                  const result = await call("storage.save", {
+                    dataDir: dataDir ?? state.storage.dataDir,
+                  });
+                  setDataDir(null);
+                  return result;
+                }, "数据目录已切换，现有记录已迁移；原数据库保留为迁移前副本，无需重启。")
+              }
+            >
+              {busy ? "正在处理…" : "保存目录并迁移数据"}
+            </Button>
+            <p className="ops-footnote">
+              迁移需等待当前采集、分析和投递完成。目标目录不能已有
+              ops.sqlite；迁移成功后新数据写入新目录，原目录保留迁移前副本，不再同步。
+            </p>
+            <p className="ops-footnote">
+              目录指针保存在 <code>{state.storage?.settingsFile}</code>
+              。已保存的目录在重启后继续使用；外置盘未挂载时不会悄悄创建空数据库。
+            </p>
+            <p className="ops-footnote">
+              DSH 会话、工作目录文件、宿主日志和凭据仍由 DSH
+              管理，不随本插件数据库迁移。Docker 部署时填写容器内已挂载的目录。
+            </p>
+          </div>
+        </section>
+      )}
       {source && (
         <div className="ops-overlay">
           <form
@@ -566,7 +690,11 @@ export function OpsPanel({ call }) {
               <h2>{source.id ? "编辑" : "添加"}告警源</h2>
               <Button onClick={() => setSource(null)}>关闭</Button>
             </div>
-            {error && <div role="alert" className="ops-notice ops-error">{error}</div>}
+            {error && (
+              <div role="alert" className="ops-notice ops-error">
+                {error}
+              </div>
+            )}
             <Field title="名称">
               <input
                 required
@@ -665,7 +793,11 @@ export function OpsPanel({ call }) {
               </div>
               <Button onClick={() => setTask(null)}>关闭</Button>
             </div>
-            {error && <div role="alert" className="ops-notice ops-error">{error}</div>}
+            {error && (
+              <div role="alert" className="ops-notice ops-error">
+                {error}
+              </div>
+            )}
             <div className="ops-form-grid">
               <div>
                 <Field title="任务名称">
@@ -758,104 +890,14 @@ export function OpsPanel({ call }) {
                     )}
                   </div>
                 </Field>
-                <Field title="报告投递">
-                  <select
-                    value={task.deliveryMode}
-                    onChange={(e) =>
-                      setTaskField("deliveryMode", e.target.value)
-                    }
-                  >
-                    <option value="off">关闭：只保存在运维平台</option>
-                    <option value="manual">手动：查看报告后点击推送</option>
-                    <option value="auto">自动：完成后推送到选定目标</option>
-                  </select>
-                </Field>
-                {task.deliveryMode !== "off" && (
-                  <>
-                    <Field title="本地 IM 机器人">
-                      <select
-                        value={botId}
-                        onChange={async (e) => {
-                          const id = e.target.value;
-                          setBotId(id);
-                          setTargets([]);
-                          if (id) {
-                            const t = await act(() =>
-                              call("im.targets", { botId: id }),
-                            );
-                            if (t) setTargets(t);
-                          }
-                        }}
-                      >
-                        <option value="">选择机器人</option>
-                        {bots.map((b) => (
-                          <option key={b.botId} value={b.botId}>
-                            {b.channel} · {b.botId}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Field title="添加接收目标">
-                      <select
-                        value=""
-                        onChange={(e) => {
-                          if (
-                            e.target.value &&
-                            !task.targets.some(
-                              (t) =>
-                                t.botId === botId &&
-                                t.targetId === e.target.value,
-                            )
-                          )
-                            setTaskField("targets", [
-                              ...task.targets,
-                              { botId, targetId: e.target.value },
-                            ]);
-                        }}
-                      >
-                        <option value="">选择已保存的群聊或私聊目标</option>
-                        {targets.map((t) => (
-                          <option key={t.targetId} value={t.targetId}>
-                            {t.name || t.targetId} · {t.kind}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <div className="ops-targets">
-                      {task.targets.map((t) => (
-                        <div key={t.botId + t.targetId}>
-                          <span>
-                            {t.targetId}
-                            <small>{t.botId}</small>
-                          </span>
-                          <Button
-                            onClick={() =>
-                              setTaskField(
-                                "targets",
-                                task.targets.filter((x) => x !== t),
-                              )
-                            }
-                          >
-                            移除
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                    <small>
-                      目标在 DSH-IM 中创建；未安装 IM 插件不影响本地分析。
-                    </small>
-                    <label className="ops-check">
-                      <input
-                        type="checkbox"
-                        checked={task.sendDataOnFailure}
-                        onChange={(e) =>
-                          setTaskField("sendDataOnFailure", e.target.checked)
-                        }
-                      />
-                      分析失败时发送标明“AI 未完成”的数据汇总
-                    </label>
-                  </>
-                )}
+                <DeliverySettings
+                  key={task.id ?? "new"}
+                  value={task}
+                  onChange={setTask}
+                  call={call}
+                  im={state.im}
+                  disabled={busy}
+                />
               </div>
             </div>
             <Field title="排查步骤（支持 Markdown，无需 SKILL 格式）">

@@ -83,7 +83,7 @@ export class Engine {
     return (await this.credentials.resolve(credentialRef(source.id)))?.value;
   }
   async tick() {
-    if (this.closed || this.tickBusy) return;
+    if (this.closed || this.paused || this.tickBusy) return;
     this.tickBusy = true;
     try {
       const config = this.store.getSettings();
@@ -154,7 +154,7 @@ export class Engine {
     }
   }
   drain() {
-    if (this.closed || this.busy) return;
+    if (this.closed || this.paused || this.busy) return;
     this.busy = true;
     this.drainPromise = (async () => {
       try {

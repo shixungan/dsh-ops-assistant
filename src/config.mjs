@@ -30,16 +30,16 @@ export function sourceConfig(input, existing) {
     authMode: input.authMode === "body" ? "body" : "bearer",
   };
 }
-export function taskConfig(input, sources, existing) {
-  const sourceIds = [...new Set(input.sourceIds ?? [])];
-  if (
-    !sourceIds.length ||
-    sourceIds.some((id) => !sources.some((s) => s.id === id && s.enabled))
-  )
-    throw new Error("至少选择一个已启用的告警源");
+export function deliveryConfig(input) {
   const targets = (input.targets ?? []).map((t) => ({
     botId: text(t.botId, "机器人 ID"),
     targetId: text(t.targetId, "投递目标 ID"),
+    ...(typeof t.channel === "string"
+      ? { channel: text(t.channel, "渠道", 100) }
+      : {}),
+    ...(typeof t.targetName === "string"
+      ? { targetName: text(t.targetName, "目标名称", 500) }
+      : {}),
   }));
   if (targets.length > 10) throw new Error("最多选择 10 个投递目标");
   const mode = input.deliveryMode ?? "off";
@@ -47,6 +47,19 @@ export function taskConfig(input, sources, existing) {
     throw new Error("无效投递模式");
   if (mode !== "off" && !targets.length)
     throw new Error("请选择机器人及投递目标");
+  return {
+    deliveryMode: mode,
+    targets,
+    sendDataOnFailure: input.sendDataOnFailure !== false,
+  };
+}
+export function taskConfig(input, sources, existing) {
+  const sourceIds = [...new Set(input.sourceIds ?? [])];
+  if (
+    !sourceIds.length ||
+    sourceIds.some((id) => !sources.some((s) => s.id === id && s.enabled))
+  )
+    throw new Error("至少选择一个已启用的告警源");
   return {
     id: existing?.id ?? randomUUID(),
     name: text(input.name, "任务名称"),
@@ -70,9 +83,7 @@ export function taskConfig(input, sources, existing) {
     allowedTools: [
       ...new Set((input.allowedTools ?? []).map((n) => text(n, "工具名", 300))),
     ],
-    deliveryMode: mode,
-    targets,
-    sendDataOnFailure: input.sendDataOnFailure !== false,
+    ...deliveryConfig(input),
     nextEnd: existing?.nextEnd ?? null,
     createdAt: existing?.createdAt ?? Date.now(),
   };

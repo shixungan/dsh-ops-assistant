@@ -6,7 +6,7 @@ DSH 运维管理插件：告警接入 → 关联分析 → 本地报告 → 可�
 
 目标：DeepSeek Harness **0.2.1-rc.5** Web profile，Ubuntu 24.04，Node.js 22.19 或更高。插件在 DSH 左侧增加“运维管理”，包括告警接入、巡检任务、分析报告和可选 IM 投递。
 
-0.1.0 是供联调的首版，已通过本地测试及真实 rc.5 的加载、页面和 API 联调。尚未完成生产监控、模型及飞书机器人的端到端验收；验证范围见 [验证记录](docs/VALIDATION.md)。
+0.1.1 是供联调的试用版，已通过本地测试及真实 rc.5 的加载、页面和 API 联调。尚未完成生产监控、模型及飞书机器人的端到端验收；验证范围见 [验证记录](docs/VALIDATION.md)。
 
 ## 已实现
 
@@ -24,15 +24,15 @@ DSH 运维管理插件：告警接入 → 关联分析 → 本地报告 → 可�
 
 从 [Releases](https://github.com/shixungan/dsh-ops-assistant/releases) 下载预构建安装包。尚未发布到 npm registry，不能直接按 npm 包名安装。
 
-将 `dsh-ops-assistant-0.1.0.tgz` 传到 Ubuntu，例如 `/opt/dsh-plugins/`。**使用运行 DSH 的同一 Linux 用户、相同 DSH_HOME 和 profile** 执行：
+可在 DSH 插件安装框直接填写发布包地址，或使用下面的在线安装命令。**使用运行 DSH 的同一 Linux 用户、相同 DSH_HOME 和 profile** 执行：
 
 ```bash
 dsh --version
 node --version
-dsh plugin --profile web add -w /opt/dsh-plugins/dsh-ops-assistant-0.1.0.tgz --registry=https://registry.npmmirror.com
+dsh plugin --profile web add -w https://github.com/shixungan/dsh-ops-assistant/releases/download/v0.1.1/dsh-ops-assistant-0.1.1.tgz --registry=https://registry.npmmirror.com
 ```
 
-这个安装包已包含构建好的页面，没有运行时 npm 第三方依赖，不需要从 GitHub 拉源码。随后按你当前的方式重启 DSH 服务并刷新浏览器；开发测试环境也可启动 `dsh web --no-open`。如果实际 profile 不是 `web`，将命令中的 profile 替换为你实际使用的 profile。
+这个安装包已包含构建好的页面，没有运行时 npm 第三方依赖，不需要拉源码构建。无法在线下载时，可将 `.tgz` 上传到服务器，再把上面的 URL 换成该文件的绝对路径。随后按你当前的方式重启 DSH 服务并刷新浏览器；开发测试环境也可启动 `dsh web --no-open`。如果实际 profile 不是 `web`，将命令中的 profile 替换为你实际使用的 profile。
 
 不必重复启动第二个 DSH 实例。已有 systemd 服务时，重启已有服务；本项目没有假定你的服务单元名称。
 
@@ -50,7 +50,12 @@ dsh plugin --profile web add -w /opt/dsh-plugins/dsh-ops-assistant-0.1.0.tgz --r
 6. 粘贴或编辑排查步骤。无需命名为 `SKILL.md`，当前版本将文本随任务保存。
 7. 第一次选择 **关闭：只保存在运维平台**，保持“自动巡检”关闭，点击“立即巡检”。
 8. 检查报告、数据源状态、原始告警和分析会话。验证通过后再开启自动巡检。
-9. 需要推送时，在 DSH-IM 中接好机器人，创建并测试目标。在运维任务选择手动或自动投递，再选择机器人和接收目标。
+9. 需要推送时，在 DSH-IM 中接好机器人，在“机器人齿轮 → 新建目标”创建、测试并保存群聊或私聊目标。打开“运维管理 → IM 投递”，选择巡检任务，再选择渠道、机器人、接收目标和投递模式，点击“保存投递配置”。任务配置弹窗也提供相同入口。
+10. 如需使用另一块盘，在“数据存储”页填写服务器上的绝对目录，例如 `/data/dsh-ops-assistant`，点击“保存目录并迁移数据”。
+
+IM 配置按任务保存，可选择多个目标。保存配置不会发送测试消息，也不会修改已有报告的接收目标。列表为空时页面会区分插件未启用、主动投递接口不兼容、机器人未接入和目标未保存；在 DSH-IM 完成配置后点击“刷新渠道与目标”。
+
+[查看 IM 投递配置界面示例](docs/im-settings.png)。
 
 DSH-IM 是可选依赖。不安装时告警采集和本地报告照常可用。插件使用 `listBots()`、`listTargets()` 和 `send(botId,targetId,text)`；你的 IM 版本若没有这些服务方法，需使用支持主动投递接口的版本。已按 DSH-IM v5.10.0 的公开契约编写，但没有连接真实飞书账号做投递验收。
 
@@ -76,13 +81,19 @@ DSH-IM 是可选依赖。不安装时告警采集和本地报告照常可用。�
 $DSH_HOME/integrations/dsh-ops-assistant/ops.sqlite
 ```
 
-若未设置 `DSH_HOME`，采用当前运行用户的 `~/.dsh`。凭据由 DSH 自己的凭据服务管理。若将插件数据放在已有 `/data` 盘，可在 DSH 插件配置中设置：
+若未设置 `DSH_HOME`，采用当前运行用户的 `~/.dsh`。数据库包含来源和任务设置、告警原文、分析报告、采集快照及 IM 投递记录。**凭据、DSH 会话、工作目录文件和宿主日志由 DSH 管理，不随本插件数据库迁移。**
+
+从 0.1.1 开始，可在插件的“数据存储”页查看实际路径并填写新的目录。变更会等待当前实例空闲；仍有管理操作、采集、分析、排队任务或投递正在执行时明确拒绝，请等其完成后重试。迁移使用 SQLite backup 读取 WAL 中已提交记录，校验目标数据库后切换；无需重启。原数据库保留为迁移前副本，此后不再同步。目标不能已有 `ops.sqlite` 或 WAL/SHM 文件，不覆盖、不合并现有数据库。
+
+路径选择持久化在 `$DSH_HOME/integrations/dsh-ops-assistant/storage.json`，这是留在原位置的小型目录指针。已保存的页面设置优先于插件 `dataDir` 配置，重启继续使用新盘。保存过的数据库文件缺失时停止加载并报错，不静默创建空库；请先检查磁盘挂载。迁移中断时旧数据库仍保留，目标残留文件不会被再次覆盖，可选一个新的专用目录重试。
+
+首次部署也可通过 DSH 插件配置设置初始目录（尚未在页面保存路径时生效）：
 
 ```yaml
 dataDir: /data/dsh-ops-assistant
 ```
 
-为该目录设置 DSH 用户读写权限。本插件不会重新分区、格式化磁盘或迁移已有数据。
+为该目录设置 DSH 用户读写权限。Docker 部署应先挂载磁盘，再填容器内路径。本插件不会重新分区或格式化磁盘。修改 `DSH_HOME` 本身仍是宿主迁移，不能只搬走这个 SQLite 文件而丢失凭据和目录指针。
 
 每个数据库实例仅应由一个 DSH Host 使用；首版是单机单工作进程设计。任务执行并发为 1，避免无 GPU 环境多个长任务互相争抢内存。界面的超时覆盖采集和全部分析；任务超时或输出超限会明确失败，原始记录仍可查看。
 

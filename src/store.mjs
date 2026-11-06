@@ -1,10 +1,22 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, chmodSync } from "node:fs";
+import { DatabaseSync, backup } from "node:sqlite";
+import {
+  mkdirSync,
+  chmodSync,
+  existsSync,
+  copyFileSync,
+  constants,
+  unlinkSync,
+  openSync,
+  fsyncSync,
+  closeSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
 // One local SQLite database; raw events are immutable per batch. Never store credentials here.
 export class Store {
   constructor(path) {
+    this.path = path;
     if (path !== ":memory:")
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
@@ -81,5 +93,47 @@ export class Store {
   }
   close() {
     this.db.close();
+  }
+  async relocate(path, persist) {
+    for (const suffix of ["", "-wal", "-shm"])
+      if (existsSync(path + suffix))
+        throw new Error(
+          "目标目录已有 ops.sqlite 或关联文件，请选择新的专用目录；不会覆盖已有数据",
+        );
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    let next,
+      created = false,
+      committed = false;
+    try {
+      await backup(this.db, temporary);
+      // COPYFILE_EXCL protects existing data even if the destination appears during the backup.
+      copyFileSync(temporary, path, constants.COPYFILE_EXCL);
+      created = true;
+      chmodSync(path, 0o600);
+      next = new Store(path);
+      if (next.db.prepare("PRAGMA quick_check").get().quick_check !== "ok")
+        throw new Error("迁移后的数据库校验失败，继续使用原目录");
+      next.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      const fd = openSync(path, "r+");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      persist();
+      const previous = this.db;
+      this.db = next.db;
+      this.path = path;
+      committed = true;
+      previous.close();
+    } finally {
+      if (!committed) {
+        next?.close();
+        if (created)
+          for (const suffix of ["", "-wal", "-shm"])
+            if (existsSync(path + suffix)) unlinkSync(path + suffix);
+      }
+      if (existsSync(temporary)) unlinkSync(temporary);
+    }
   }
 }

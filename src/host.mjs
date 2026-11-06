@@ -1,10 +1,14 @@
-import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { Store } from "./store.mjs";
+import { StorageManager } from "./storage.mjs";
 import { Engine } from "./engine.mjs";
 import { createDshAnalyzer } from "./dsh.mjs";
-import { sourceConfig, taskConfig, credentialRef } from "./config.mjs";
+import {
+  sourceConfig,
+  taskConfig,
+  deliveryConfig,
+  credentialRef,
+} from "./config.mjs";
 import { collectSource, pollAlertmanager } from "./collectors.mjs";
+import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
 
 export const name = "dsh-ops-assistant";
 export const inject = [
@@ -16,17 +20,8 @@ export const inject = [
 ];
 
 export async function apply(ctx, config = {}) {
-  const store = new Store(
-    resolve(
-      config.dataDir ??
-        resolve(
-          process.env.DSH_HOME ?? resolve(homedir(), ".dsh"),
-          "integrations",
-          "dsh-ops-assistant",
-        ),
-      "ops.sqlite",
-    ),
-  );
+  const storage = new StorageManager(config);
+  const store = storage.store;
   const getIm = () =>
     typeof ctx.get === "function" ? ctx.get("dshIm") : undefined;
   const engine = new Engine({
@@ -42,6 +37,7 @@ export async function apply(ctx, config = {}) {
     engine,
     credentials: ctx.credentials,
     getIm,
+    storage,
     getTools: () =>
       ctx.tools
         .schemas()
@@ -121,6 +117,7 @@ export async function apply(ctx, config = {}) {
     tick();
     return async () => {
       clearInterval(timer);
+      await storage.movePromise?.catch(() => {});
       await engine.close();
       await engine.tickPromise?.catch(() => {});
       await engine.pollPromise?.catch(() => {});
@@ -135,8 +132,9 @@ export function createHandler({
   credentials,
   getIm,
   getTools = () => [],
+  storage,
 }) {
-  return async (method, payload = {}, signal) => {
+  const handle = async (method, payload = {}, signal) => {
     if (!payload || typeof payload !== "object" || Array.isArray(payload))
       throw new Error("无效请求");
     const config = store.getSettings();
@@ -144,19 +142,24 @@ export function createHandler({
       case "state":
         return {
           config,
-          runs: store
-            .runs()
-            .map(({ alerts, report, ...run }) => ({
-              ...run,
-              alertCount: alerts.length,
-              summary: report?.summary,
-              coveredCount: report?.coveredIds.length ?? 0,
-            })),
+          runs: store.runs().map(({ alerts, report, ...run }) => ({
+            ...run,
+            alertCount: alerts.length,
+            summary: report?.summary,
+            coveredCount: report?.coveredIds.length ?? 0,
+          })),
           deliveries: store.deliveries().map(({ text, ...row }) => row),
           pollStatus: engine.pollStatus ?? {},
           fatalError: engine.fatalError ?? null,
-          imAvailable: !!getIm()?.send,
+          imAvailable: imStatus(getIm()).ready,
+          im: imStatus(getIm()),
+          storage: storage?.info() ?? null,
         };
+      case "storage.save": {
+        if (!storage) throw new Error("当前实例不支持修改数据目录");
+        storage.movePromise = storage.move(payload.dataDir, engine);
+        return await storage.movePromise;
+      }
       case "source.save": {
         const existing = payload.id
           ? config.sources.find((s) => s.id === payload.id)
@@ -207,16 +210,36 @@ export function createHandler({
           ? config.tasks.find((t) => t.id === payload.id)
           : undefined;
         if (payload.id && !existing) throw new Error("任务不存在");
-        const task = taskConfig(payload, config.sources, existing);
+        const delivery = deliveryConfig(payload);
+        await validateTargets(getIm(), delivery);
+        const latest = store.getSettings();
+        const current = latest.tasks.find((t) => t.id === payload.id);
+        const task = taskConfig(
+          { ...payload, ...delivery },
+          latest.sources,
+          current,
+        );
         if (
           !existing ||
-          (!existing.enabled && task.enabled) ||
-          existing.intervalMinutes !== task.intervalMinutes
+          (!current.enabled && task.enabled) ||
+          current.intervalMinutes !== task.intervalMinutes
         )
           task.nextEnd = null;
-        config.tasks = [...config.tasks.filter((t) => t.id !== task.id), task];
-        store.saveSettings(config);
+        latest.tasks = [...latest.tasks.filter((t) => t.id !== task.id), task];
+        store.saveSettings(latest);
         return task;
+      }
+      case "task.delivery.save": {
+        if (!config.tasks.some((t) => t.id === payload.id))
+          throw new Error("任务不存在");
+        const delivery = deliveryConfig(payload);
+        await validateTargets(getIm(), delivery);
+        const latest = store.getSettings();
+        const current = latest.tasks.find((t) => t.id === payload.id);
+        if (!current) throw new Error("任务不存在");
+        Object.assign(current, delivery);
+        store.saveSettings(latest);
+        return current;
       }
       case "task.run":
         return engine.manual(payload.id);
@@ -250,15 +273,43 @@ export function createHandler({
         await engine.retryDelivery(payload.id, payload.confirmUnknown === true);
         return { accepted: true };
       case "im.bots":
-        return getIm()?.listBots ? await getIm().listBots() : [];
+        return listBots(getIm());
       case "im.targets":
-        return getIm()?.listTargets
-          ? await getIm().listTargets(payload.botId)
-          : [];
+        return listTargets(getIm(), payload.botId);
       case "tools.list":
         return getTools();
       default:
         throw new Error("未知管理操作");
+    }
+  };
+  let requests = 0;
+  let moving = false;
+  const reads = new Set([
+    "state",
+    "run.get",
+    "run.alerts",
+    "tools.list",
+    "im.bots",
+    "im.targets",
+  ]);
+  return async (method, payload, signal) => {
+    if (method === "storage.save") {
+      if (moving || requests)
+        throw new Error("仍有管理操作正在执行，请稍后再更改数据目录");
+      moving = true;
+      try {
+        return await handle(method, payload, signal);
+      } finally {
+        moving = false;
+      }
+    }
+    if (moving && !reads.has(method))
+      throw new Error("数据目录正在迁移，请稍后再试");
+    requests++;
+    try {
+      return await handle(method, payload, signal);
+    } finally {
+      requests--;
     }
   };
 }
