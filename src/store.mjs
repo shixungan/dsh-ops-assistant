@@ -1,0 +1,85 @@
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync, chmodSync } from "node:fs";
+import { dirname } from "node:path";
+
+// One local SQLite database; raw events are immutable per batch. Never store credentials here.
+export class Store {
+  constructor(path) {
+    if (path !== ":memory:")
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    this.db = new DatabaseSync(path);
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+      CREATE TABLE IF NOT EXISTS settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, window_start INTEGER NOT NULL, window_end INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE(task_id,window_start,window_end));
+      CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS observations (source_id TEXT NOT NULL, event_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(source_id,event_key));`);
+    if (path !== ":memory:") chmodSync(path, 0o600);
+  }
+  getSettings() {
+    return JSON.parse(
+      this.db.prepare("SELECT data FROM settings WHERE id=?").get("config")
+        ?.data ?? '{"sources":[],"tasks":[]}',
+    );
+  }
+  saveSettings(data) {
+    this.db
+      .prepare("INSERT OR REPLACE INTO settings VALUES (?,?)")
+      .run("config", JSON.stringify(data));
+  }
+  putRun(run) {
+    this.db
+      .prepare(
+        "INSERT INTO runs VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+      )
+      .run(run.id, run.taskId, run.start, run.end, JSON.stringify(run));
+  }
+  run(id) {
+    const row = this.db.prepare("SELECT data FROM runs WHERE id=?").get(id);
+    return row ? JSON.parse(row.data) : null;
+  }
+  window(taskId, start, end) {
+    const row = this.db
+      .prepare(
+        "SELECT data FROM runs WHERE task_id=? AND window_start=? AND window_end=?",
+      )
+      .get(taskId, start, end);
+    return row ? JSON.parse(row.data) : null;
+  }
+  runs(limit = 100) {
+    return this.db
+      .prepare("SELECT data FROM runs ORDER BY window_end DESC LIMIT ?")
+      .all(limit)
+      .map((r) => JSON.parse(r.data));
+  }
+  putDelivery(row) {
+    this.db
+      .prepare("INSERT OR REPLACE INTO deliveries VALUES (?,?)")
+      .run(row.id, JSON.stringify(row));
+  }
+  delivery(id) {
+    const row = this.db
+      .prepare("SELECT data FROM deliveries WHERE id=?")
+      .get(id);
+    return row ? JSON.parse(row.data) : null;
+  }
+  deliveries() {
+    return this.db
+      .prepare("SELECT data FROM deliveries ORDER BY rowid DESC LIMIT 200")
+      .all()
+      .map((r) => JSON.parse(r.data));
+  }
+  observe(sourceId, key, row) {
+    this.db
+      .prepare("INSERT OR REPLACE INTO observations VALUES (?,?,?)")
+      .run(sourceId, key, JSON.stringify(row));
+  }
+  observations(sourceId) {
+    return this.db
+      .prepare("SELECT data FROM observations WHERE source_id=?")
+      .all(sourceId)
+      .map((r) => JSON.parse(r.data));
+  }
+  close() {
+    this.db.close();
+  }
+}

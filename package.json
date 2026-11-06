@@ -1,0 +1,55 @@
+{
+  "name": "dsh-ops-assistant",
+  "version": "0.1.0",
+  "description": "DSH 运维管理：告警接入、定时分析、报告与可选 DSH-IM 投递",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shixungan/dsh-ops-assistant.git"
+  },
+  "homepage": "https://github.com/shixungan/dsh-ops-assistant#readme",
+  "bugs": "https://github.com/shixungan/dsh-ops-assistant/issues",
+  "type": "module",
+  "license": "UNLICENSED",
+  "main": "./src/host.mjs",
+  "exports": {
+    ".": "./src/host.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "playbooks",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run build && npm test",
+    "prepack": "npm run check"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
