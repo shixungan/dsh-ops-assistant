@@ -241,6 +241,7 @@ export function DeliverySettings({ value, onChange, call, im, disabled }) {
         机器人凭据和接收目标由本机 DSH-IM
         管理；这里选择目标并保存到巡检任务，不会创建新的机器人。
       </small>
+      <p className="ops-footnote">窗口内没有告警时仅保存本地报告，不推送任何 IM；采集缺口或失败原因仍可在本地报告查看。</p>
       <label className="ops-check">
         <input
           type="checkbox"
@@ -248,7 +249,7 @@ export function DeliverySettings({ value, onChange, call, im, disabled }) {
           disabled={disabled}
           onChange={(e) => update("sendDataOnFailure", e.target.checked)}
         />
-        分析失败时发送标明“AI 未完成”的数据汇总
+        有告警但分析失败时，发送标明“AI 未完成”的数据汇总
       </label>
     </div>
   );

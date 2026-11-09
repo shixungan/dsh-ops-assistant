@@ -260,11 +260,9 @@ export function createHandler({
       case "run.retry":
         return engine.retry(payload.id);
       case "run.deliver":
-        await engine.deliver(payload.id);
-        return { accepted: true };
+        return await engine.deliver(payload.id) ?? { accepted: true };
       case "delivery.retry":
-        await engine.retryDelivery(payload.id, payload.confirmUnknown === true);
-        return { accepted: true };
+        return await engine.retryDelivery(payload.id, payload.confirmUnknown === true) ?? { accepted: true };
       case "im.bots":
         return listBots(getIm());
       case "im.targets":

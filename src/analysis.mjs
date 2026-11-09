@@ -1,5 +1,6 @@
 import { assertFormatOnly } from "./analysis-format.mjs";
 import { coverageWarnings } from "./coverage.mjs";
+export { deliveryText } from "./delivery.mjs";
 
 export const DEFAULT_INSTRUCTIONS = `你是一名运维分析员。按时间线梳理告警，归一资产名称，识别重复事件和可能的依赖关系，再验证关联假设。
 使用已授权的查询工具按需查 WeKnora 文档、MemOS 历史、资产和指标。记录证据来源；如果无对应工具或无拓扑数据，写明无法验证。
@@ -87,6 +88,8 @@ const outputContract = `最终仅输出 JSON，不要 Markdown 围栏：
 字符串内的双引号、反斜杠和换行必须按 JSON 规则转义，例如：${JSON.stringify({ evidence: ['ping_percent_packet_loss{project="idc-idc"} > 5'] })}。
 输出前检查每个数组的 ] 和每个对象的 } 都已正确闭合。`;
 
+const summaryStyle = "summary 用 2–3 句概括异常、影响及结论的不确定性；资产细节、内部编号和查询证据放入各事件的 evidence。assessment 简明区分事实与假设，unknowns 列出尚未确认的内容，actions 给出下一步查询建议。";
+
 async function analyzeWithFormatRepair(
   run, task, analyze, signal, onProgress, prompt, expectedIds, stage,
 ) {
@@ -166,7 +169,7 @@ export async function analyzeRun(run, task, analyze, signal, onProgress) {
       stage,
       analyzed: partials.flatMap((p) => p.coveredIds).length,
     });
-    const prompt = `${DEFAULT_INSTRUCTIONS}${extraInstructions}\n\n${outputContract}\n窗口：[${new Date(run.start).toISOString()}, ${new Date(run.end).toISOString()})\n数据源覆盖：${JSON.stringify(run.sources)}\n告警原文批次：\n${JSON.stringify(chunks[i])}`;
+    const prompt = `${DEFAULT_INSTRUCTIONS}${extraInstructions}\n\n${summaryStyle}\n${outputContract}\n窗口：[${new Date(run.start).toISOString()}, ${new Date(run.end).toISOString()})\n数据源覆盖：${JSON.stringify(run.sources)}\n告警原文批次：\n${JSON.stringify(chunks[i])}`;
     partials.push(
       await analyzeWithFormatRepair(
         run, task, analyze, signal, onProgress, prompt,
@@ -181,7 +184,7 @@ export async function analyzeRun(run, task, analyze, signal, onProgress) {
       "分批摘要超过跨批关联预算；原文已保留，请提高预算后重新分析",
     );
   onProgress({ stage: "跨批次关联分析", analyzed: run.alerts.length });
-  const prompt = `${DEFAULT_INSTRUCTIONS}${extraInstructions}\n${outputContract}\n请对以下分批分析做全局关联；保留每个告警的 ID 和证据，不得把假设升级为事实。\n${serialized}`;
+  const prompt = `${DEFAULT_INSTRUCTIONS}${extraInstructions}\n${summaryStyle}\n${outputContract}\n请对以下分批分析做全局关联；保留每个告警的 ID 和证据，不得把假设升级为事实。\n${serialized}`;
   return analyzeWithFormatRepair(
     run, task, analyze, signal, onProgress, prompt,
     run.alerts.map((a) => a.alertId), "跨批次关联分析",
@@ -215,38 +218,4 @@ export function reportMarkdown(run) {
       ...event.actions.map((v) => `- ${v}`),
     );
   return data.join("\n");
-}
-
-export function deliveryText(run, maxChars = 3500) {
-  const complete = run.status === "completed";
-  const lines = [
-    `运维巡检｜${new Date(run.start).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}—${new Date(run.end).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
-    `批次 ${run.id}`,
-    complete
-      ? `AI 分析完成，覆盖 ${run.report.coveredIds.length}/${run.alerts.length} 条`
-      : `AI 分析未完成，仅发送数据汇总：${run.error ?? run.stage}`,
-    ...run.sources.map((s) => `${s.name}：${s.count ?? 0} 条（${s.status}）`),
-    ...(run.sources.some((s) => s.status !== "ok")
-      ? [...coverageWarnings(run.sources), "所选来源的时间窗尚未完整覆盖，不能据此判定无异常。"]
-      : []),
-    "",
-  ];
-  if (complete) lines.push(run.report.summary);
-  else {
-    const counts = new Map();
-    for (const a of run.alerts)
-      counts.set(a.host, (counts.get(a.host) ?? 0) + 1);
-    lines.push(
-      ...[...counts]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([host, count]) => `${host}：${count} 条`),
-    );
-  }
-  const suffix =
-    "\n\n完整报告与告警原文：DSH → 运维管理 → 分析报告，按批次 ID 查询。";
-  let body = lines.join("\n");
-  if (body.length + suffix.length > maxChars)
-    body = body.slice(0, maxChars - suffix.length - 20) + "\n[消息摘要已缩短]";
-  return body + suffix;
 }

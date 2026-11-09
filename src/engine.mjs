@@ -5,6 +5,9 @@ import {
 import { analyzeRun, deliveryText, reportMarkdown } from "./analysis.mjs";
 import { credentialRef } from "./config.mjs";
 
+const noAlerts = (run) => Array.isArray(run?.alerts) && run.alerts.length === 0;
+const skippedEmptyReport = () => ({ skipped: true, reason: "no-alerts" });
+
 export class Engine {
   constructor({ store, credentials, analyze, getIm, fetcher, now = Date.now, coverageWaitMs = 120000 }) {
     Object.assign(this, { store, credentials, analyze, getIm, fetcher, now, coverageWaitMs });
@@ -347,6 +350,7 @@ export class Engine {
     }
     if (
       !this.closed &&
+      !noAlerts(run) &&
       run.task.deliveryMode === "auto" &&
       (run.status === "completed" || run.task.sendDataOnFailure)
     )
@@ -368,6 +372,7 @@ export class Engine {
     const run = this.store.run(id);
     if (!run || ["queued", "collecting", "analyzing"].includes(run.status))
       throw new Error("报告尚未完成");
+    if (noAlerts(run)) return skippedEmptyReport();
     if (run.task.deliveryMode === "off")
       throw new Error("此任务未开启 IM 推送");
     for (const target of run.task.targets) {
@@ -382,7 +387,9 @@ export class Engine {
         runId: run.id,
         version: run.version,
         ...target,
+        alertCount: run.alerts.length,
         text: deliveryText(run),
+        format: "markdown",
         status: "pending",
         attempts: 0,
         createdAt: this.now(),
@@ -400,9 +407,23 @@ export class Engine {
     return promise;
   }
   async sendDeliveryAttempt(row) {
-    if (this.closed || this.sending.has(row.id)) return;
+    if (this.closed || this.sending.has(row.id) ||
+        ["accepted", "unknown", "skipped"].includes(row.status)) return;
     this.sending.add(row.id);
     try {
+      // Pending messages created by an older version must obey the same quiet
+      // rule after restart. A missing report is not proof of an empty window.
+      const run = this.store.run(row.runId);
+      const empty = Number.isInteger(row.alertCount) && row.alertCount >= 0
+        ? row.alertCount === 0 : noAlerts(run);
+      if (empty) {
+        row.status = "skipped";
+        row.error = "本批次采集到 0 条告警，已跳过 IM 推送";
+        row.skippedAt = this.now();
+        delete row.nextAttempt;
+        this.store.putDelivery(row);
+        return skippedEmptyReport();
+      }
       const im = this.getIm();
       if (!im?.send) {
         row.status = "pending";
@@ -417,6 +438,7 @@ export class Engine {
       this.store.putDelivery(row);
       try {
         const result = await im.send(row.botId, row.targetId, row.text, {
+          format: row.format ?? "plain",
           signal: AbortSignal.any([
             this.lifecycle.signal,
             AbortSignal.timeout(30000),
@@ -453,13 +475,18 @@ export class Engine {
   }
   async retryDelivery(id, confirmUnknown = false) {
     const row = this.store.delivery(id);
-    if (!row || row.status === "accepted" || row.status === "sending")
+    if (!row || ["accepted", "sending", "skipped"].includes(row.status))
       throw new Error("无法重试此投递");
     if (row.status === "unknown" && !confirmUnknown)
       throw new Error("可能已发送，请明确确认后重试");
+    // An unknown delivery may already have reached the recipient. Preserve its
+    // historical status even if an explicit retry is now suppressed as empty.
+    if (row.status === "unknown" &&
+        (row.alertCount === 0 || (row.alertCount == null && noAlerts(this.store.run(row.runId)))))
+      return skippedEmptyReport();
     row.status = "pending";
     row.nextAttempt = this.now();
-    await this.sendDelivery(row);
+    return await this.sendDelivery(row);
   }
   report(id) {
     const run = this.store.run(id);

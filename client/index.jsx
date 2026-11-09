@@ -17,6 +17,7 @@ const labels = {
   pending: "待投递",
   sending: "投递中",
   accepted: "平台已接受",
+  skipped: "已跳过（0 条告警）",
   unknown: "投递结果未知",
   ok: "完整查询",
   partial: "数据不完整",
@@ -328,7 +329,7 @@ export function OpsPanel({ call }) {
               ["正在处理", activeRuns.length, "本地查询、分析与等待队列"],
               [
                 "待处理投递",
-                state.deliveries.filter((d) => d.status !== "accepted").length,
+                state.deliveries.filter((d) => !["accepted", "skipped"].includes(d.status)).length,
                 "每个目标分别记录状态",
               ],
             ].map(([label, value, hint]) => (
@@ -590,7 +591,7 @@ export function OpsPanel({ call }) {
                     </td>
                     <td>{d.attempts}</td>
                     <td>
-                      {!["accepted", "sending"].includes(d.status) && (
+                      {!["accepted", "sending", "skipped"].includes(d.status) && (
                         <Button
                           disabled={busy}
                           onClick={() => {
@@ -1023,6 +1024,7 @@ export function OpsPanel({ call }) {
                 查看原始告警（{report.run.alertCount}）
               </Button>
               {report.run.task.deliveryMode !== "off" &&
+                report.run.alertCount > 0 &&
                 !["queued", "collecting", "analyzing"].includes(
                   report.run.status,
                 ) && (
@@ -1039,6 +1041,9 @@ export function OpsPanel({ call }) {
                     推送到已配置 IM
                   </Button>
                 )}
+              {report.run.alertCount === 0 && (
+                <small>本窗口未查询到告警，仅保存在本地，不推送 IM。</small>
+              )}
             </div>
             <pre className="ops-report">{report.markdown}</pre>
             <details>

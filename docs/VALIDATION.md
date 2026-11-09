@@ -49,12 +49,21 @@
 - 验证页面/飞书共用的来源提示包含具体前段和末尾缺口，及首次采集、失败和快照限制；没有把尚未接入的其他平台列为缺失。
 - 使用模拟接口及分析器，尚未在用户生产 DSH 中验证新版等待和实际轮询耗时。
 
+## 0.1.5 零告警静默与 Markdown 卡片
+
+- 2026-11-09 在 Windows / Node.js 25.5.0 执行 `npm run check`，构建及 125 项测试通过。
+- 验证定时/手动巡检零告警不建立投递，`partial`/失败及 `sendDataOnFailure` 不绕过静默规则；旧 pending 空记录跳过、重启不补发、accepted/unknown 历史保留。有告警的失败汇总继续遵循原配置。
+- 验证新投递持久保存 Markdown 格式并传递给 DSH-IM，旧消息仍按原格式重试；保持同版本目标幂等和结果未知不自动重发。
+- 验证北京时间及跨日、事件资产/原始等级/记录时间、结论/待核实/建议分区、动态文本转义、消息长度与截断提示、长名称不遮盖缺口、覆盖提醒及批次入口保留。完整报告不被摘要操作改写。
+- 核实 DSH-IM v5.10.0 的 `send(...,{format:"markdown"})` 文档、服务透传、飞书原生卡片实现及官方测试。未向真实飞书发送测试消息，实际样式需在用户加载支持此格式的 DSH-IM 后确认。
+
 ## 公开接口依据
 
 - [DSH rc.5 Session Controller](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/index.ts)：`create`、`prompt`、`cancel`。
 - [DSH rc.5 会话请求类型](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/types.ts)：`cwd`、`agentPreset`、`requestId`、`mode`、`content`。
 - [DSH rc.5 工具权限](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/core/tools/src/index.ts)：Agent scope 下 `restrict` 和最终 `guard`。
 - [DSH-IM v5.10.0 主动投递](https://github.com/xmanrui/dsh-im/blob/v5.10.0/PROACTIVE_DELIVERY.md)：本机 `listBots`、`listTargets`、`send`；不假定带投递幂等键或自动重试。
+- [DSH-IM v5.10.0 Markdown 卡片](https://github.com/xmanrui/dsh-im/blob/v5.10.0/src/channels/feishu/feishu-runtime.mjs#L726)：Markdown 文本发送为飞书 interactive 卡片；[官方测试](https://github.com/xmanrui/dsh-im/blob/v5.10.0/test/channels/feishu/proactive-markdown.test.mjs#L58)验证格式和单次投递。
 - [DSH-IM 客户端插件构建示例](https://github.com/xmanrui/dsh-im/blob/v5.10.0/plugin-src/client/build.mjs)：客户端模块装载格式；本项目按该接口独立实现。
 - [Zabbix 7.0 event.get](https://www.zabbix.com/documentation/7.0/en/manual/api/reference/event/get)：历史问题时间窗和 eventid 游标。
 - [夜莺官方 API 说明](https://flashcat.cloud/docs/content/flashcat-monitor/nightingale-v9/usecase/api/)：个人 Token 使用 `X-User-Token`，需开启 `HTTP.TokenAuth.Enable`。
