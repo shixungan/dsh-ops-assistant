@@ -21,13 +21,26 @@ export function sourceConfig(input, existing) {
     url.hash
   )
     throw new Error("地址须为 HTTP(S)，不要包含密码、查询参数或片段");
+  const normalizedUrl = url.href.replace(/\/$/, "");
+  const changedIdentity = existing &&
+    (existing.url !== normalizedUrl || existing.type !== input.type);
   return {
     id: existing?.id ?? randomUUID(),
     name: text(input.name, "名称"),
     type: input.type,
-    url: url.href.replace(/\/$/, ""),
+    url: normalizedUrl,
     enabled: input.enabled !== false,
-    authMode: input.authMode === "body" ? "body" : "bearer",
+    pollIntervalSeconds: integer(
+      input.pollIntervalSeconds ?? existing?.pollIntervalSeconds ?? 60,
+      15, 3600, "采集间隔秒数",
+    ),
+    revision: (existing?.revision ?? 0) + (changedIdentity ? 1 : 0),
+    authMode:
+      input.type === "nightingale"
+        ? "user-token"
+        : input.authMode === "body"
+          ? "body"
+          : "bearer",
   };
 }
 export function deliveryConfig(input) {

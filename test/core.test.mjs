@@ -73,10 +73,22 @@ const json = (data) =>
   new Response(JSON.stringify(data), {
     headers: { "Content-Type": "application/json" },
   });
+const n9eEvent = (id, lastEvalTime, overrides = {}) => ({
+  id,
+  hash: "same-alert",
+  rule_name: "接口异常",
+  first_trigger_time: 2,
+  trigger_time: lastEvalTime,
+  last_eval_time: lastEvalTime,
+  is_recovered: 0,
+  recover_time: 0,
+  ...overrides,
+});
 
 test("configuration does not persist a source token or URL-embedded credentials", () => {
   const s = sourceConfig({ ...source, token: "SECRET" });
   assert.equal(s.token, undefined);
+  assert.equal(s.authMode, "user-token");
   assert.throws(() =>
     sourceConfig({ ...source, url: "https://u:secret@host" }),
   );
@@ -196,28 +208,122 @@ test("Zabbix paginates large event IDs without precision loss", async () => {
   assert.equal(result.alerts.length, 500);
   assert.equal(result.status, "ok");
 });
-test("n9e does not silently drop events that started before the window", async () => {
+test("n9e requests only the half-hour window with personal-token auth and excludes recovery", async () => {
+  const rows = [
+    n9eEvent(1, 1799),
+    n9eEvent(2, 1800, { tags: ["instance=sw1:9100", "job=network"] }),
+    n9eEvent(3, 2500, { is_recovered: false }),
+    n9eEvent(4, 3599),
+    n9eEvent(5, 3600),
+    n9eEvent(6, 2700, { is_recovered: 1, recover_time: 2700 }),
+    n9eEvent(7, 2800, { is_recovered: true, recover_time: 2800 }),
+  ];
+  let calls = 0;
+  const result = await collectNightingale(
+    { ...source, url: "https://n9e.invalid/monitor", authMode: "bearer" },
+    1800000,
+    3600000,
+    {
+      token: "PERSONAL_TOKEN",
+      fetcher: async (url, options) => {
+        calls++;
+        assert.equal(url.pathname, "/monitor/api/n9e/alert-his-events/list");
+        assert.equal(options.method, "GET");
+        assert.equal(options.headers["X-User-Token"], "PERSONAL_TOKEN");
+        assert.equal(options.headers.Authorization, undefined);
+        assert.equal(url.searchParams.get("stime"), "1800");
+        assert.equal(url.searchParams.get("etime"), "3599");
+        assert.equal(url.searchParams.get("is_recovered"), "0");
+        assert.equal(url.searchParams.get("severity"), "-1");
+        assert.equal(url.searchParams.get("limit"), "500");
+        assert.equal(url.searchParams.get("p"), "1");
+        return json({ dat: { total: rows.length, list: rows }, err: "" });
+      },
+    },
+  );
+  assert.deepEqual(
+    result.alerts.map((a) => a.nativeId),
+    ["2", "3", "4"],
+  );
+  assert.deepEqual(
+    result.alerts.map((a) => a.eventTime),
+    [1800000, 2500000, 3599000],
+  );
+  // Different historical IDs are distinct reminders, even for one alert hash.
+  assert.deepEqual(result.alerts.map((a) => a.raw), [rows[1], rows[2], rows[3]]);
+  assert.equal(result.alerts[0].first, 2000);
+  assert.equal(result.alerts[0].host, "sw1:9100");
+  for (const alert of result.alerts) {
+    assert.equal(alert.last, null);
+    assert.equal(alert.phase, "窗口内告警记录（未查询恢复状态）");
+    assert.equal(alert.recoveryRaw, undefined);
+  }
+  assert.equal(result.status, "ok");
+  assert.equal(calls, 1);
+});
+test("n9e applies half-open windows to second-resolution event timestamps", async () => {
+  const rows = [10, 11, 20, 21].map((time) => n9eEvent(time, time));
+  const result = await collectNightingale(source, 10500, 20500, {
+    fetcher: async (url) => {
+      assert.equal(url.searchParams.get("stime"), "11");
+      assert.equal(url.searchParams.get("etime"), "20");
+      return json({ dat: { total: rows.length, list: rows } });
+    },
+  });
+  assert.deepEqual(result.alerts.map((a) => a.nativeId), ["11", "20"]);
+});
+test("n9e does not carry an old trigger into later windows after a separate recovery", async () => {
+  const rows = [
+    n9eEvent(1, 2),
+    n9eEvent(2, 12, { is_recovered: 1, recover_time: 12 }),
+  ];
+  const result = await collectNightingale(source, 30000, 40000, {
+    fetcher: async () => json({ dat: { total: rows.length, list: rows } }),
+  });
+  assert.deepEqual(result.alerts, []);
+  assert.equal(result.status, "ok");
+});
+test("n9e paginates the same bounded window and deduplicates repeated event IDs", async () => {
+  const rows = Array.from({ length: 501 }, (_, i) => n9eEvent(i + 1, 12));
+  let calls = 0;
   const result = await collectNightingale(source, 10000, 20000, {
     fetcher: async (url) => {
-      assert.equal(url.searchParams.get("stime"), "0");
-      assert.ok(Number(url.searchParams.get("etime")) > Date.now() / 1000);
+      calls++;
+      assert.equal(url.searchParams.get("p"), String(calls));
+      assert.equal(url.searchParams.get("stime"), "10");
+      assert.equal(url.searchParams.get("etime"), "19");
+      assert.equal(url.searchParams.get("is_recovered"), "0");
       return json({
         dat: {
-          total: 3,
-          list: [
-            { id: 1, trigger_time: 2, recover_time: 12, rule_name: "old" },
-            { id: 2, trigger_time: 15, recover_time: 0 },
-            { id: 3, trigger_time: 1, recover_time: 9 },
-          ],
+          total: 501,
+          list: calls === 1 ? rows.slice(0, 500) : rows.slice(499),
         },
       });
     },
   });
-  assert.deepEqual(
-    result.alerts.map((a) => a.nativeId),
-    ["1", "2"],
-  );
-  assert.equal(result.alerts[0].phase, "窗口内恢复");
+  assert.equal(calls, 2);
+  assert.equal(result.status, "ok");
+  assert.equal(result.alerts.length, 501);
+  assert.equal(new Set(result.alerts.map((a) => a.alertId)).size, 501);
+});
+test("n9e rejects records whose identity, event time or recovery state cannot be trusted", async () => {
+  const invalid = [
+    { ...n9eEvent(1, 12), id: undefined },
+    { ...n9eEvent(1, 12), id: null },
+    { ...n9eEvent(1, 12), last_eval_time: undefined },
+    { ...n9eEvent(1, 12), last_eval_time: null },
+    { ...n9eEvent(1, 12), last_eval_time: "invalid" },
+    { ...n9eEvent(1, 12), is_recovered: undefined },
+    { ...n9eEvent(1, 12), is_recovered: 2 },
+  ];
+  for (const row of invalid)
+    await assert.rejects(
+      collectNightingale(source, 10000, 20000, {
+        fetcher: async () => json({ dat: { total: 1, list: [row] } }),
+      }),
+      /格式|字段/,
+      `Invalid row must fail: ${JSON.stringify(row)}`,
+    );
 });
 test("n9e premature pagination termination is marked incomplete", async () => {
   let calls = 0;
@@ -226,7 +332,7 @@ test("n9e premature pagination termination is marked incomplete", async () => {
       json({
         dat: {
           total: 100,
-          list: calls++ === 0 ? [{ id: 1, trigger_time: 11 }] : [],
+          list: calls++ === 0 ? [n9eEvent(1, 11)] : [],
         },
       }),
   });
@@ -272,6 +378,8 @@ test("HTTP redirects are disallowed to protect platform tokens", async () => {
     token: "secret",
     fetcher: async (_, opts) => {
       assert.equal(opts.redirect, "error");
+      assert.equal(opts.headers.Authorization, "Bearer secret");
+      assert.equal(opts.headers["X-User-Token"], undefined);
       return json({ ok: true });
     },
   });
@@ -283,6 +391,7 @@ test("same window is queued once, and IM-off never invokes a bot", async () => {
   const engine = new Engine({
     store,
     credentials,
+    now: () => 20000,
     analyze: async () => output(["s:1"]),
     getIm: () => ({
       send: async () => {
@@ -290,8 +399,9 @@ test("same window is queued once, and IM-off never invokes a bot", async () => {
       },
     }),
     fetcher: async () =>
-      json({ dat: { total: 1, list: [{ id: 1, trigger_time: 12 }] } }),
+      json({ dat: { total: 1, list: [n9eEvent(1, 12)] } }),
   });
+  await engine.poll();
   const first = engine.enqueue(task, 10000, 20000);
   const second = engine.enqueue(task, 10000, 20000);
   await engine.drainPromise;
@@ -313,6 +423,7 @@ test("missing output IDs fail analysis and auto-deliver explicitly labelled data
   const engine = new Engine({
     store,
     credentials,
+    now: () => 20000,
     analyze: async () => output([]),
     getIm: () => ({
       send: async (b, g, value) => {
@@ -321,8 +432,9 @@ test("missing output IDs fail analysis and auto-deliver explicitly labelled data
       },
     }),
     fetcher: async () =>
-      json({ dat: { total: 1, list: [{ id: 1, trigger_time: 12 }] } }),
+      json({ dat: { total: 1, list: [n9eEvent(1, 12)] } }),
   });
+  await engine.poll();
   const r = engine.enqueue(t, 10000, 20000);
   await engine.drainPromise;
   assert.equal(store.run(r.id).status, "failed");

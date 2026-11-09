@@ -7,7 +7,7 @@ import {
   deliveryConfig,
   credentialRef,
 } from "./config.mjs";
-import { collectSource, pollAlertmanager } from "./collectors.mjs";
+import { localSourceInfo } from "./ingestion.mjs";
 import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
 
 export const name = "dsh-ops-assistant";
@@ -149,7 +149,7 @@ export function createHandler({
             coveredCount: report?.coveredIds.length ?? 0,
           })),
           deliveries: store.deliveries().map(({ text, ...row }) => row),
-          pollStatus: engine.pollStatus ?? {},
+          pollStatus: engine.sourceStatus?.() ?? {},
           fatalError: engine.fatalError ?? null,
           imAvailable: imStatus(getIm()).ready,
           im: imStatus(getIm()),
@@ -168,7 +168,7 @@ export function createHandler({
         const source = sourceConfig(payload, existing);
         if (typeof payload.token === "string" && payload.token.trim())
           await credentials.set(credentialRef(source.id), payload.token.trim());
-        else if (existing && source.url !== existing.url)
+        else if (existing && (source.url !== existing.url || source.type !== existing.type))
           await credentials.unset(credentialRef(source.id));
         signal?.throwIfAborted();
         const latest = store.getSettings();
@@ -177,30 +177,22 @@ export function createHandler({
           source,
         ];
         store.saveSettings(latest);
+        if (source.enabled && engine.refreshSource) {
+          engine.ensureIngestion(source);
+          engine.refreshSource(source.id).catch((error) => {
+            engine.fatalError = error.message;
+          });
+        }
         return source;
       }
       case "source.test": {
         const source = config.sources.find((s) => s.id === payload.id);
         if (!source) throw new Error("来源不存在");
-        const options = {
-          signal,
-          token: (await credentials.resolve(credentialRef(source.id)))?.value,
-        };
-        const end = Date.now();
-        if (source.type === "alertmanager")
-          return {
-            count: await pollAlertmanager(source, store, options),
-            note: "当前快照可访问，不代表历史完整",
-          };
-        const result = await collectSource(
-          source,
-          end - 1800000,
-          end,
-          store,
-          options,
-        );
+        if (!source.enabled) throw new Error("请先启用告警源");
+        await engine.refreshSource(source.id);
+        const result = localSourceInfo(source, store);
         return {
-          count: result.alerts.length,
+          count: result.count,
           status: result.status,
           note: result.note,
         };
@@ -284,6 +276,8 @@ export function createHandler({
   };
   let requests = 0;
   let moving = false;
+  // Keep a source's credential write, revision and settings update in order.
+  const sourceWrites = new Map();
   const reads = new Set([
     "state",
     "run.get",
@@ -307,6 +301,20 @@ export function createHandler({
       throw new Error("数据目录正在迁移，请稍后再试");
     requests++;
     try {
+      if (method === "source.save") {
+        const key = payload?.id ?? "new-source";
+        const previous = sourceWrites.get(key) ?? Promise.resolve();
+        const pending = previous.catch(() => {}).then(() => {
+          signal?.throwIfAborted();
+          return handle(method, payload, signal);
+        });
+        sourceWrites.set(key, pending);
+        try {
+          return await pending;
+        } finally {
+          if (sourceWrites.get(key) === pending) sourceWrites.delete(key);
+        }
+      }
       return await handle(method, payload, signal);
     } finally {
       requests--;

@@ -20,7 +20,7 @@ const phase = (first, last, start, end) =>
 
 export async function requestJson(
   url,
-  { token, signal, body, fetcher = fetch } = {},
+  { token, authMode = "bearer", signal, body, fetcher = fetch } = {},
 ) {
   const response = await fetcher(url, {
     method: body ? "POST" : "GET",
@@ -32,7 +32,11 @@ export async function requestJson(
     headers: {
       Accept: "application/json",
       ...(body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token
+        ? authMode === "user-token"
+          ? { "X-User-Token": token }
+          : { Authorization: `Bearer ${token}` }
+        : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -151,37 +155,58 @@ export async function collectZabbix(source, start, end, options) {
 }
 
 export async function collectNightingale(source, start, end, options) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start)
+    throw new Error("夜莺查询时间窗无效");
   const all = new Map();
   let partial = false;
   let total = null;
-  // n9e filters history by last_eval_time, NOT by trigger_time. A continuing
-  // event can be updated after this report's end. Query through collection time
-  // (plus n9e's standard one-day clock allowance), then filter locally by the
-  // event interval. Using etime=window.end would silently lose these events.
-  const queryEnd = Math.floor(Math.max(Date.now(), end) / 1000) + 86400;
+  // v9.1 history filters last_eval_time with inclusive second boundaries.
+  // Read this run's [start, end) records only; do not reconstruct lifecycles.
+  const queryStart = Math.ceil(start / 1000);
+  const queryEnd = Math.ceil(end / 1000) - 1;
+  const scopeNote =
+    "仅查询本时间窗内的历史告警记录（按 last_eval_time）；排除恢复记录，不判断当前是否恢复，范围受平台保留期和账号权限约束";
+  if (queryStart > queryEnd)
+    return { alerts: [], status: "ok", note: scopeNote };
   for (let p = 1; p <= 100; p++) {
     options.signal?.throwIfAborted();
     const url = new URL(`${source.url}/api/n9e/alert-his-events/list`);
     for (const [k, v] of Object.entries({
-      stime: 0,
+      stime: queryStart,
       etime: queryEnd,
-      is_recovered: -1,
+      is_recovered: 0,
       severity: -1,
       limit: 500,
       p,
     }))
       url.searchParams.set(k, String(v));
-    const result = await requestJson(url, options);
+    const result = await requestJson(url, { ...options, authMode: "user-token" });
     if (
+      !result ||
       result.err ||
       !Array.isArray(result.dat?.list) ||
-      !Number.isFinite(result.dat.total)
+      !Number.isSafeInteger(result.dat.total) ||
+      result.dat.total < 0
     )
       throw new Error("夜莺历史接口格式不符，请核对版本、Token 与权限");
     if (total !== null && total !== result.dat.total) partial = true;
     total = result.dat.total;
     let added = 0;
     for (const raw of result.dat.list) {
+      const validId =
+        typeof raw?.id === "number"
+          ? Number.isSafeInteger(raw.id) && raw.id > 0
+          : typeof raw?.id === "string" && /^[1-9]\d*$/.test(raw.id);
+      if (
+        !validId ||
+        ![0, 1, "0", "1", false, true].includes(raw.is_recovered) ||
+        !["number", "string"].includes(typeof raw.last_eval_time) ||
+        !Number.isSafeInteger(Number(raw.last_eval_time)) ||
+        Number(raw.last_eval_time) <= 0
+      )
+        throw new Error(
+          "夜莺历史事件格式不符，缺少有效的 id、last_eval_time 或 is_recovered",
+        );
       const id = String(raw.id);
       if (!all.has(id)) added++;
       all.set(id, raw);
@@ -193,9 +218,23 @@ export async function collectNightingale(source, start, end, options) {
     }
   }
   const alerts = [...all.values()]
+    .filter(
+      (raw) =>
+        Number(raw.is_recovered) === 0 &&
+        sec(raw.last_eval_time) >= start &&
+        sec(raw.last_eval_time) < end,
+    )
     .map((raw) => {
       const first = sec(raw.first_trigger_time || raw.trigger_time);
-      const last = Number(raw.recover_time) > 0 ? sec(raw.recover_time) : null;
+      // History lists expose tags as ["key=value"], unlike current events.
+      const tags = Object.fromEntries(
+        (Array.isArray(raw.tags) ? raw.tags : [])
+          .filter((tag) => typeof tag === "string" && tag.indexOf("=") > 0)
+          .map((tag) => [
+            tag.slice(0, tag.indexOf("=")).trim(),
+            tag.slice(tag.indexOf("=") + 1),
+          ]),
+      );
       return {
         alertId: `${source.id}:${raw.id}`,
         sourceId: source.id,
@@ -206,22 +245,24 @@ export async function collectNightingale(source, start, end, options) {
         host:
           raw.target_ident ||
           raw.tags_map?.ident ||
+          tags.ident ||
           raw.tags_map?.instance ||
+          tags.instance ||
           "未知资产",
         severity: String(raw.severity),
         first,
-        last,
-        phase: phase(first, last, start, end),
+        eventTime: sec(raw.last_eval_time),
+        last: null,
+        phase: "窗口内告警记录（未查询恢复状态）",
         raw,
       };
-    })
-    .filter((a) => overlaps(a.first, a.last, start, end));
+    });
   return {
     alerts,
     status: partial ? "partial" : "ok",
     note: partial
-      ? "历史分页达到上限、列表发生变化或分页不完整；不可视为全量"
-      : "查询平台保留的历史记录并按时间相交筛选；历史清理和账号授权限定可见范围",
+      ? `${scopeNote}；窗口内分页达到上限、列表发生变化或分页不完整，不可视为全量`
+      : scopeNote,
   };
 }
 

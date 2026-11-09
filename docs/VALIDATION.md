@@ -25,6 +25,14 @@
 - 用户本机 DSH-IM 的机器人发现及真实群聊投递。
 - 大型告警库长期运行、断电恢复、连续数天追赶和多用户并发编辑。
 
+## 0.1.2 持续采集与本地巡检
+
+- 接口核对日期：2026-11-09。核对夜莺 v9.1.0、v9.1.1 的个人 Token 鉴权、历史接口时间过滤和恢复字段，不代表用户实例已经联调通过。
+- 来源添加并启用后独立后台采集，默认 60 秒轮询，可配置 15–3600 秒；夜莺首次读取最近 30 分钟，后续依据持久采集进度和 2 分钟重叠范围继续拉取。个人 Token 使用 `X-User-Token`，需启用 `[HTTP.TokenAuth] Enable = true`，`is_recovered=0` 排除恢复记录。
+- 巡检只读取本地数据库，每次实际开始时查询此前一个巡检周期的 `[start,end)`；默认周期为 30 分钟。未覆盖的窗口须标记不完整，不把空列表当作无告警结论；不再延迟 2 分钟执行或逐窗补排停机期间的巡检。
+- 2026-11-09 在 Windows / Node.js 25.5.0 执行 `npm run check`，页面构建及全部 51 项测试通过。测试临时目录使用可写工作区。新增测试覆盖无巡检任务时独立采集、事件幂等保存、事务回滚、失败重试、重启续采、实际执行时的本地窗口查询、自定义目录迁移保留事件和进度，以及编辑来源和并发保存时的隔离。
+- 夜莺接口用例使用模拟响应；尚未完成真实夜莺 v9.1 的认证、权限、后台采集和数据验证。未新增活跃列表采集或生命周期关联，不把历史触发记录的 `recover_time=0` 解释为当前持续告警。
+
 ## 公开接口依据
 
 - [DSH rc.5 Session Controller](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/index.ts)：`create`、`prompt`、`cancel`。
@@ -33,7 +41,9 @@
 - [DSH-IM v5.10.0 主动投递](https://github.com/xmanrui/dsh-im/blob/v5.10.0/PROACTIVE_DELIVERY.md)：本机 `listBots`、`listTargets`、`send`；不假定带投递幂等键或自动重试。
 - [DSH-IM 客户端插件构建示例](https://github.com/xmanrui/dsh-im/blob/v5.10.0/plugin-src/client/build.mjs)：客户端模块装载格式；本项目按该接口独立实现。
 - [Zabbix 7.0 event.get](https://www.zabbix.com/documentation/7.0/en/manual/api/reference/event/get)：历史问题时间窗和 eventid 游标。
-- [夜莺官方查询说明](https://github.com/ccfos/nightingale/blob/main/aiagent/skill/embedded/builtin/query-alert-events/SKILL.md)：历史路径、分页和 Bearer Token。
-- [夜莺历史模型实现](https://github.com/ccfos/nightingale/blob/main/models/alert_his_event.go)：时间过滤字段为 `last_eval_time`。main 会变化，用户现场版本需复核。
+- [夜莺官方 API 说明](https://flashcat.cloud/docs/content/flashcat-monitor/nightingale-v9/usecase/api/)：个人 Token 使用 `X-User-Token`，需开启 `HTTP.TokenAuth.Enable`。
+- [夜莺 v9.1.0 鉴权实现](https://github.com/ccfos/nightingale/blob/v9.1.0/center/router/router_mw.go)：个人 Token 与 Bearer JWT 使用不同认证入口。
+- [夜莺 v9.1.0 历史接口](https://github.com/ccfos/nightingale/blob/v9.1.0/center/router/router_alert_his_event.go)：`stime/etime`、`is_recovered`、`p/limit` 参数及 `dat.list/dat.total` 响应。
+- [夜莺 v9.1.0 历史模型](https://github.com/ccfos/nightingale/blob/v9.1.0/models/alert_his_event.go)：时间过滤字段为 `last_eval_time`，触发和恢复分别保存为历史记录。
 
 业务实现是本插件的设计，不代表上述项目官方推荐或认可。

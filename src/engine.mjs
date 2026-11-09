@@ -1,5 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
-import { collectSource, pollAlertmanager } from "./collectors.mjs";
+import {
+  ensureIngestion, ingestSource, collectLocalSource, localSourceInfo,
+} from "./ingestion.mjs";
 import { analyzeRun, deliveryText, reportMarkdown } from "./analysis.mjs";
 import { credentialRef } from "./config.mjs";
 
@@ -9,7 +11,6 @@ export class Engine {
     this.queue = [];
     this.busy = false;
     this.current = null;
-    this.lastPoll = 0;
     this.polling = false;
     this.tickBusy = false;
     this.sending = new Set();
@@ -34,7 +35,13 @@ export class Engine {
         this.store.putDelivery(d);
       }
   }
-  enqueue(task, start, end) {
+  enqueue(task, start, end, { rolling = false } = {}) {
+    if (rolling) {
+      const ids = [...(this.current ? [this.current.id] : []), ...this.queue];
+      const pending = ids.map((id) => this.store.run(id)).find((run) =>
+        run?.taskId === task.id && ["queued", "collecting", "analyzing"].includes(run.status));
+      if (pending) return pending;
+    }
     const existing = this.store.window(task.id, start, end);
     if (existing) return existing;
     const run = {
@@ -43,6 +50,7 @@ export class Engine {
       task: structuredClone(task),
       start,
       end,
+      rolling,
       status: "queued",
       stage: "等待执行",
       alerts: [],
@@ -61,7 +69,7 @@ export class Engine {
     const task = this.store.getSettings().tasks.find((t) => t.id === taskId);
     if (!task) throw new Error("任务不存在");
     const end = Math.floor(this.now() / 1000) * 1000;
-    return this.enqueue(task, end - task.intervalMinutes * 60000, end);
+    return this.enqueue(task, end - task.intervalMinutes * 60000, end, { rolling: true });
   }
   retry(id) {
     const run = this.store.run(id);
@@ -91,28 +99,19 @@ export class Engine {
       let changed = false;
       for (const task of config.tasks.filter((t) => t.enabled)) {
         const period = task.intervalMinutes * 60000;
-        if (task.nextEnd === null) {
-          task.nextEnd = Math.floor(now / period) * period;
+        if (task.nextEnd == null) {
+          task.nextEnd = now + period;
           changed = true;
         }
-        let emitted = 0;
-        while (
-          task.nextEnd + 120000 <= now &&
-          emitted < 48 &&
-          this.queue.length < 100
-        ) {
-          this.enqueue(task, task.nextEnd - period, task.nextEnd);
-          task.nextEnd += period;
-          emitted++;
+        if (task.nextEnd <= now && this.queue.length < 100) {
+          const end = Math.floor(now / 1000) * 1000;
+          this.enqueue(task, end - period, end, { rolling: true });
+          task.nextEnd = now + period;
           changed = true;
         }
       }
       if (changed) this.store.saveSettings(config);
-      if (now - this.lastPoll >= 60000 && !this.polling) {
-        this.lastPoll = now;
-        this.pollPromise = this.poll();
-        this.pollPromise.catch(() => {});
-      }
+      this.poll().catch((error) => { this.fatalError = error.message; });
       for (const d of this.store.deliveries())
         if (d.status === "pending" && (d.nextAttempt ?? 0) <= now)
           await this.sendDelivery(d);
@@ -121,36 +120,51 @@ export class Engine {
       this.tickBusy = false;
     }
   }
-  async poll() {
+  ensureIngestion(source) {
+    return ensureIngestion(source, this.store, this.now());
+  }
+  sourceStatus() {
+    return Object.fromEntries(this.store.getSettings().sources.map((source) =>
+      [source.id, localSourceInfo(source, this.store)]));
+  }
+  async refreshSource(sourceId) {
+    while (this.polling) await this.pollPromise;
+    return this.poll(sourceId);
+  }
+  poll(forceSourceId) {
+    if (this.closed || this.paused) return Promise.resolve();
+    if (this.polling) return this.pollPromise;
     this.polling = true;
-    try {
-      for (const source of this.store
-        .getSettings()
-        .sources.filter((s) => s.enabled && s.type === "alertmanager")) {
-        try {
-          await pollAlertmanager(
-            source,
-            this.store,
-            {
-              token: await this.token(source),
-              signal: this.lifecycle.signal,
-              fetcher: this.fetcher,
-            },
-            this.now(),
-          );
-          this.pollStatus ??= {};
-          this.pollStatus[source.id] = { ok: true, at: this.now() };
-        } catch {
-          this.pollStatus ??= {};
-          this.pollStatus[source.id] = {
-            ok: false,
-            at: this.now(),
-            error: "轮询失败，检查来源连通性及权限",
-          };
-        }
-      }
-    } finally {
+    this.pollPromise = this.pollSources(forceSourceId).finally(() => {
       this.polling = false;
+    });
+    return this.pollPromise;
+  }
+  async pollSources(forceSourceId) {
+    for (const source of this.store
+      .getSettings()
+      .sources.filter((s) => s.enabled && (!forceSourceId || s.id === forceSourceId))) {
+      if (this.closed || this.paused) break;
+      const now = this.now();
+      const state = this.ensureIngestion(source);
+      if (!forceSourceId && state.at != null &&
+          now - state.at < (source.pollIntervalSeconds ?? 60) * 1000) continue;
+      const isCurrent = () => !this.closed && this.store.getSettings().sources.some((s) =>
+        s.id === source.id && s.enabled && s.type === source.type && s.url === source.url &&
+        (s.revision ?? 0) === (source.revision ?? 0));
+      try {
+        const token = await this.token(source);
+        if (!isCurrent()) continue;
+        await ingestSource(source, this.store, {
+          token,
+          signal: AbortSignal.any([this.lifecycle.signal, AbortSignal.timeout(120000)]),
+          fetcher: this.fetcher,
+        }, now, isCurrent);
+      } catch (error) {
+        if (isCurrent()) this.store.putIngestionState(source.id, {
+          ...state, at: now, status: "failed", note: `后台采集失败：${error.message}`,
+        });
+      }
     }
   }
   drain() {
@@ -182,8 +196,12 @@ export class Engine {
     ]);
     try {
       if (!run.reuseRaw) {
+        if (run.rolling) {
+          run.end = Math.floor(this.now() / 1000) * 1000;
+          run.start = run.end - run.task.intervalMinutes * 60000;
+        }
         run.status = "collecting";
-        run.stage = "采集原始告警";
+        run.stage = "查询本地告警";
         this.store.putRun(run);
         const config = this.store.getSettings();
         for (const id of run.task.sourceIds) {
@@ -191,27 +209,11 @@ export class Engine {
           const source = config.sources.find((s) => s.id === id && s.enabled);
           try {
             if (!source) throw new Error("来源已停用或删除");
-            if (source.type === "alertmanager")
-              await pollAlertmanager(
-                source,
-                this.store,
-                {
-                  token: await this.token(source),
-                  signal,
-                  fetcher: this.fetcher,
-                },
-                this.now(),
-              );
-            const result = await collectSource(
+            const result = collectLocalSource(
               source,
               run.start,
               run.end,
               this.store,
-              {
-                token: await this.token(source),
-                signal,
-                fetcher: this.fetcher,
-              },
             );
             run.alerts.push(...result.alerts);
             run.sources.push({

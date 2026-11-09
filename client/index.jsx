@@ -7,7 +7,7 @@ export const inject = ["slots", "connection"];
 const PANEL = "dsh-ops-assistant";
 const labels = {
   queued: "等待执行",
-  collecting: "正在采集",
+  collecting: "正在读取本地告警",
   analyzing: "正在分析",
   completed: "分析完成",
   failed: "失败",
@@ -59,6 +59,22 @@ function Badge({ status, children }) {
     <span className={`ops-badge ops-${status}`}>
       {children ?? labels[status] ?? status}
     </span>
+  );
+}
+function SourceStatus({ status, enabled }) {
+  if (!status)
+    return <small>{enabled ? "等待首次后台采集" : "后台采集已停用"}</small>;
+  const result = status.status ?? (status.ok ? "ok" : "failed");
+  return (
+    <div className="ops-footnote">
+      <p>
+        后台采集：{enabled ? ({ ok: "正常", partial: "数据不完整", failed: "失败" }[result] ?? "等待采集") : "已停用"}
+        {" · "}本地告警：{status.count ?? 0} 条
+      </p>
+      <p>最近尝试：{time(status.at)} · 最近成功：{time(status.successAt)}</p>
+      <p>已采集至：{time(status.coveredUntil)}</p>
+      {status.note && <p>{status.note}</p>}
+    </div>
   );
 }
 function Field({ title, hint, children, group = false }) {
@@ -308,7 +324,7 @@ export function OpsPanel({ call }) {
                 state.config.tasks.filter((t) => t.enabled).length,
                 "Host 运行期间按周期执行",
               ],
-              ["正在处理", activeRuns.length, "采集、分析与等待队列"],
+              ["正在处理", activeRuns.length, "本地查询、分析与等待队列"],
               [
                 "待处理投递",
                 state.deliveries.filter((d) => d.status !== "accepted").length,
@@ -337,8 +353,8 @@ export function OpsPanel({ call }) {
             {showRuns(state.runs.slice(0, 8))}
           </section>
           <div className="ops-footnote">
-            窗口采用北京时间展示、UTC 保存。自动任务在窗口结束 2
-            分钟后开始；历史缺失会在报告中明确标记。
+            告警源独立持续采集到本地。巡检执行时查询此前一个巡检周期的本地告警；
+            时间采用北京时间展示，采集尚未覆盖的时段会在报告中标记。
           </div>
         </>
       )}
@@ -347,7 +363,7 @@ export function OpsPanel({ call }) {
           <div className="ops-section-title">
             <div>
               <h2>告警接入</h2>
-              <p>直接从监控平台采集告警。凭据保存在 DSH 凭据服务中。</p>
+              <p>启用后持续采集并保存到本地，无需先创建巡检任务。凭据保存在 DSH 凭据服务中。</p>
             </div>
             <Button
               primary
@@ -359,6 +375,7 @@ export function OpsPanel({ call }) {
                   token: "",
                   enabled: true,
                   authMode: "bearer",
+                  pollIntervalSeconds: 60,
                 })
               }
             >
@@ -376,15 +393,11 @@ export function OpsPanel({ call }) {
                 </div>
                 <p>{sourceLabels[s.type]}</p>
                 <code>{s.url}</code>
+                <p>后台采集间隔：{s.pollIntervalSeconds ?? 60} 秒</p>
                 {s.type === "alertmanager" && (
                   <p className="ops-warn">快照观测，无法保证完整历史</p>
                 )}
-                {state.pollStatus[s.id] && (
-                  <small>
-                    最近轮询：{time(state.pollStatus[s.id].at)} ·{" "}
-                    {state.pollStatus[s.id].ok ? "成功" : "失败"}
-                  </small>
-                )}
+                <SourceStatus status={state.pollStatus[s.id]} enabled={s.enabled} />
                 <div className="ops-actions">
                   <Button onClick={() => setSource({ ...s, token: "" })}>
                     编辑
@@ -414,7 +427,7 @@ export function OpsPanel({ call }) {
           <div className="ops-section-title">
             <div>
               <h2>巡检任务</h2>
-              <p>设置来源、分析步骤和可选的 IM 投递。</p>
+              <p>从本地告警中查询最近一个巡检周期的数据，按排查步骤分析并可选投递。</p>
             </div>
             <Button
               primary
@@ -615,8 +628,8 @@ export function OpsPanel({ call }) {
         <section className="ops-section">
           <div className="ops-section-title">
             <div>
-              <h2>数据保存位置</h2>
-              <p>填写运行 DSH 的服务器上的目录，可使用另一块已挂载磁盘。</p>
+              <h2>告警与报告保存位置</h2>
+              <p>自定义本地告警数据库目录，可使用 DSH 服务器上另一块已挂载磁盘。</p>
             </div>
           </div>
           <div className="ops-settings-body">
@@ -626,12 +639,12 @@ export function OpsPanel({ call }) {
                 {state.storage?.databasePath ?? "正在读取…"}
               </code>
               <small>
-                告警原文、分析报告、任务设置、采集快照和 IM 投递记录均保存在此
-                SQLite 数据库。
+                持续采集的告警原文、采集进度、分析报告、任务设置和 IM 投递记录均保存在此
+                SQLite 数据库；未配置巡检的告警源也会保存数据。
               </small>
             </div>
             <Field
-              title="数据保存目录"
+              title="告警数据保存目录"
               hint="Ubuntu 示例：/data/dsh-ops-assistant。填写目录，不要填写数据库文件名；运行 DSH 的用户需要有读写权限。"
             >
               <input
@@ -660,7 +673,7 @@ export function OpsPanel({ call }) {
             </Button>
             <p className="ops-footnote">
               迁移需等待当前采集、分析和投递完成。目标目录不能已有
-              ops.sqlite；迁移成功后新数据写入新目录，原目录保留迁移前副本，不再同步。
+              ops.sqlite；告警与采集进度会一同迁移。成功后新数据写入新目录，原目录保留迁移前副本，不再同步。
             </p>
             <p className="ops-footnote">
               目录指针保存在 <code>{state.storage?.settingsFile}</code>
@@ -681,7 +694,7 @@ export function OpsPanel({ call }) {
               e.preventDefault();
               const v = await act(
                 () => call("source.save", source),
-                "告警源已保存",
+                source.enabled ? "告警源已保存，后台持续采集已启用" : "告警源已保存，后台采集已停用",
               );
               if (v) setSource(null);
             }}
@@ -735,8 +748,12 @@ export function OpsPanel({ call }) {
               />
             </Field>
             <Field
-              title="API Token"
-              hint="编辑时留空保留原凭据；修改地址后须重新填写。"
+              title={source.type === "nightingale" ? "夜莺个人 Token" : "API Token"}
+              hint={
+                source.type === "nightingale"
+                  ? "在夜莺个人信息 → Token 管理创建，并启用 HTTP.TokenAuth。编辑时留空保留原凭据；修改地址后须重新填写。"
+                  : "编辑时留空保留原凭据；修改地址后须重新填写。"
+              }
             >
               <input
                 type="password"
@@ -745,6 +762,25 @@ export function OpsPanel({ call }) {
                 onChange={(e) =>
                   setSource({ ...source, token: e.target.value })
                 }
+              />
+            </Field>
+            {source.type === "nightingale" && (
+              <p className="ops-footnote">
+                启用后持续拉取告警并保存到本地，排除恢复记录；巡检仅查询本地告警，不判断当前恢复状态。
+              </p>
+            )}
+            <Field
+              title="后台采集间隔（秒）"
+              hint="默认 60 秒，与巡检周期独立。启用后立即开始采集，不需要先创建巡检任务。"
+            >
+              <input
+                required
+                type="number"
+                min="15"
+                max="3600"
+                step="1"
+                value={source.pollIntervalSeconds ?? 60}
+                onChange={(e) => setSource({ ...source, pollIntervalSeconds: Number(e.target.value) })}
               />
             </Field>
             {source.type === "zabbix" && (
@@ -807,7 +843,7 @@ export function OpsPanel({ call }) {
                     onChange={(e) => setTaskField("name", e.target.value)}
                   />
                 </Field>
-                <Field title="巡检周期（分钟）">
+                <Field title="巡检周期（分钟）" hint="例如 30 分钟：每次执行查询本地此前 30 分钟的告警。后台采集独立运行。">
                   <input
                     type="number"
                     min="5"
@@ -836,7 +872,7 @@ export function OpsPanel({ call }) {
                     }
                   />
                 </Field>
-                <Field title="采集与分析总超时（分钟）">
+                <Field title="本地查询与分析总超时（分钟）">
                   <input
                     type="number"
                     min="1"
