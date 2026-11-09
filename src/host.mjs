@@ -177,6 +177,7 @@ export function createHandler({
           source,
         ];
         store.saveSettings(latest);
+        engine.notifyCoverageWaiters?.();
         if (source.enabled && engine.refreshSource) {
           engine.ensureIngestion(source);
           engine.refreshSource(source.id).catch((error) => {

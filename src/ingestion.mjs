@@ -98,6 +98,7 @@ export function collectLocalSource(source, start, end, store) {
   if (source.type === "alertmanager") {
     const result = collectAlertmanager(observationSource(source), start, end, store);
     result.alerts = result.alerts.map((alert) => ({ ...alert, sourceId: source.id }));
+    result.coverage = { kind: "snapshot" };
     return result;
   }
   const state = store.ingestionState(source.id);
@@ -108,12 +109,26 @@ export function collectLocalSource(source, start, end, store) {
       : alert);
   const covered = state?.sourceRevision === revision(source) &&
     state.coverageStart <= start && state.coveredUntil >= end;
+  const current = state?.sourceRevision === revision(source) ? state : null;
+  const coverage = {
+    kind: covered ? "complete"
+      : current?.status === "failed" ? "failed"
+      : current?.status === "partial" ? "partial"
+      : current?.successAt == null ? "initial" : "gap",
+    coveredFrom: current?.coverageStart ?? null,
+    coveredUntil: current?.successAt != null ? current.coveredUntil : null,
+    missingHeadSeconds: current?.successAt != null
+      ? Math.max(0, Math.ceil((Math.min(end, current.coverageStart) - start) / 1000)) : null,
+    missingTailSeconds: current?.successAt != null
+      ? Math.max(0, Math.ceil((end - Math.max(start, current.coveredUntil)) / 1000)) : null,
+  };
   const coverageNote = state?.sourceRevision === revision(source) && state.successAt != null
     ? `已采集至 ${new Date(state.coveredUntil).toISOString()}，窗口末尾尚差 ${Math.max(0, Math.ceil((end - state.coveredUntil) / 1000))} 秒；首次覆盖从 ${new Date(state.coverageStart).toISOString()} 开始。`
     : "此来源尚无已完成的采集窗口。";
   return {
     alerts,
     status: covered ? "ok" : "partial",
+    coverage,
     note: covered
       ? "从本地告警库按事件时间读取本次窗口；范围受上游保留期及账号权限约束"
       : `从本地告警库读取；后台采集尚未覆盖完整窗口。${coverageNote}${state?.note ?? "尚未开始采集"}`,

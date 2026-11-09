@@ -6,8 +6,8 @@ import { analyzeRun, deliveryText, reportMarkdown } from "./analysis.mjs";
 import { credentialRef } from "./config.mjs";
 
 export class Engine {
-  constructor({ store, credentials, analyze, getIm, fetcher, now = Date.now }) {
-    Object.assign(this, { store, credentials, analyze, getIm, fetcher, now });
+  constructor({ store, credentials, analyze, getIm, fetcher, now = Date.now, coverageWaitMs = 120000 }) {
+    Object.assign(this, { store, credentials, analyze, getIm, fetcher, now, coverageWaitMs });
     this.queue = [];
     this.busy = false;
     this.current = null;
@@ -17,6 +17,7 @@ export class Engine {
     this.closed = false;
     this.lifecycle = new AbortController();
     this.deliveryPromises = new Set();
+    this.coverageWaiters = new Set();
   }
   initialize() {
     for (const run of this.store.runs(100000)) {
@@ -118,6 +119,7 @@ export class Engine {
       this.drain();
     } finally {
       this.tickBusy = false;
+      this.notifyCoverageWaiters();
     }
   }
   ensureIngestion(source) {
@@ -137,6 +139,7 @@ export class Engine {
     this.polling = true;
     this.pollPromise = this.pollSources(forceSourceId).finally(() => {
       this.polling = false;
+      this.notifyCoverageWaiters();
     });
     return this.pollPromise;
   }
@@ -164,8 +167,74 @@ export class Engine {
         if (isCurrent()) this.store.putIngestionState(source.id, {
           ...state, at: now, status: "failed", note: `后台采集失败：${error.message}`,
         });
+      } finally {
+        this.notifyCoverageWaiters();
       }
     }
+  }
+  notifyCoverageWaiters() {
+    for (const wake of [...this.coverageWaiters]) wake();
+  }
+  waitForLocalCoverage(run, signal) {
+    signal.throwIfAborted();
+    const waitMs = Math.max(0, Math.min(
+      120000,
+      Number.isFinite(this.coverageWaitMs) ? this.coverageWaitMs : 120000,
+      run.task.timeoutMinutes * 60000 / 3,
+    ));
+    if (!waitMs || this.closed || this.paused) return;
+    const needsNextPoll = (source) => {
+      const state = this.store.ingestionState(source.id);
+      const lag = run.end - state?.coveredUntil;
+      return source.enabled && source.type !== "alertmanager" &&
+        state?.sourceRevision === (source.revision ?? 0) &&
+        state.status === "ok" && state.successAt != null &&
+        state.coverageStart <= run.start && lag > 0 &&
+        lag <= ((source.pollIntervalSeconds ?? 60) + 10) * 1000;
+    };
+    // Only a normal polling gap can be waited away. A missing prefix, failed
+    // collection, or snapshot-only source remains explicitly incomplete.
+    const pending = new Map(this.store.getSettings().sources
+      .filter((source) => run.task.sourceIds.includes(source.id) && needsNextPoll(source))
+      .map((source) => [source.id, source]));
+    if (!pending.size) return;
+    run.stage = "等待后台采集覆盖窗口";
+    this.store.putRun(run);
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let timer;
+      const finish = (error) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.coverageWaiters.delete(wake);
+        signal.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolve();
+      };
+      const abort = () => finish(signal.reason ?? new Error("等待采集被取消"));
+      const wake = () => {
+        try {
+          signal.throwIfAborted();
+          const sources = this.store.getSettings().sources;
+          for (const original of pending.values()) {
+            const current = sources.find((source) => source.id === original.id);
+            if (!current || current.url !== original.url || current.type !== original.type ||
+                (current.revision ?? 0) !== (original.revision ?? 0) || !needsNextPoll(current))
+              pending.delete(original.id);
+          }
+          if (!pending.size || this.closed || this.paused) finish();
+        } catch (error) {
+          finish(error);
+        }
+      };
+      this.coverageWaiters.add(wake);
+      signal.addEventListener("abort", abort, { once: true });
+      // No upstream request or shifted window: the independent collector wakes
+      // us after committing. The bounded timer falls back to the local snapshot.
+      timer = setTimeout(() => finish(), waitMs);
+      wake();
+    });
   }
   drain() {
     if (this.closed || this.paused || this.busy) return;
@@ -203,6 +272,10 @@ export class Engine {
         run.status = "collecting";
         run.stage = "查询本地告警";
         this.store.putRun(run);
+        const coverageWait = this.waitForLocalCoverage(run, signal);
+        if (coverageWait) await coverageWait;
+        signal.throwIfAborted();
+        run.stage = "查询本地告警";
         const config = this.store.getSettings();
         for (const id of run.task.sourceIds) {
           signal.throwIfAborted();
@@ -221,6 +294,7 @@ export class Engine {
               name: source.name,
               status: result.status,
               note: result.note,
+              coverage: result.coverage,
               count: result.alerts.length,
             });
           } catch (error) {

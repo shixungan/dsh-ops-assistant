@@ -491,7 +491,7 @@ test("summary messages are bounded and clearly label incompleteness", () => {
   r.sources[0].status = "partial";
   const text = deliveryText(r);
   assert.ok(text.length <= 3500);
-  assert.match(text, /数据源存在缺失/);
+  assert.match(text, /所选来源的时间窗尚未完整覆盖/);
   assert.match(text, /摘要已缩短/);
 });
 test("host handler never returns saved tokens to browser state", async () => {

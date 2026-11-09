@@ -1,4 +1,5 @@
 import { assertFormatOnly } from "./analysis-format.mjs";
+import { coverageWarnings } from "./coverage.mjs";
 
 export const DEFAULT_INSTRUCTIONS = `你是一名运维分析员。按时间线梳理告警，归一资产名称，识别重复事件和可能的依赖关系，再验证关联假设。
 使用已授权的查询工具按需查 WeKnora 文档、MemOS 历史、资产和指标。记录证据来源；如果无对应工具或无拓扑数据，写明无法验证。
@@ -149,7 +150,7 @@ export async function analyzeRun(run, task, analyze, signal, onProgress) {
     return {
       summary: run.sources.every((s) => s.status === "ok")
         ? "本时间窗内未查询到告警。"
-        : "本次可见数据中未查到告警，但数据源不完整，不能判定无异常。",
+        : `本次可见数据中未查到告警；${coverageWarnings(run.sources).join("；")}。所选来源的时间窗尚未完整覆盖，不能判定无异常。`,
       incidents: [],
       coveredIds: [],
     };
@@ -226,7 +227,7 @@ export function deliveryText(run, maxChars = 3500) {
       : `AI 分析未完成，仅发送数据汇总：${run.error ?? run.stage}`,
     ...run.sources.map((s) => `${s.name}：${s.count ?? 0} 条（${s.status}）`),
     ...(run.sources.some((s) => s.status !== "ok")
-      ? ["数据源存在缺失或不完整，不能据此判定无异常。"]
+      ? [...coverageWarnings(run.sources), "所选来源的时间窗尚未完整覆盖，不能据此判定无异常。"]
       : []),
     "",
   ];

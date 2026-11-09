@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { DEFAULT_INSTRUCTIONS } from "../src/analysis.mjs";
+import { coverageWarnings } from "../src/coverage.mjs";
 import { CSS } from "./styles.js";
 import { DeliverySettings } from "./delivery-settings.jsx";
 export const name = "ops-assistant-ui";
@@ -210,9 +211,9 @@ export function OpsPanel({ call }) {
               </td>
               <td>
                 <Badge status={run.status} />
-                {run.sources.some((s) => s.status !== "ok") && (
-                  <small className="ops-warn">数据源不完整</small>
-                )}
+                {coverageWarnings(run.sources).map((warning, index) => (
+                  <small className="ops-warn" key={index}>{warning}</small>
+                ))}
                 <small>{run.stage}</small>
               </td>
               <td>
