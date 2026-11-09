@@ -28,11 +28,13 @@ export function createDshAnalyzer(ctx) {
     const agent = ctx.agents.get(sessionId);
     if (!agent?.ctx?.tools?.guard || !agent.ctx.tools.restrict)
       throw new Error("DSH rc.5 的 Agent 工具策略接口不可用");
-    const allow = new Set(task.allowedTools ?? []);
+    const allow = new Set(task.formatOnly ? [] : task.allowedTools ?? []);
     // run_code is DSH's PTC transport; every nested tool also passes the guard.
     agent.ctx.tools.restrict({ allow: [...allow] });
     agent.ctx.tools.guard((exec) =>
-      exec.name === "run_code" || allow.has(exec.name)
+      task.formatOnly
+        ? "格式修正会话不允许调用工具，只能整理已有回复。"
+        : exec.name === "run_code" || allow.has(exec.name)
         ? undefined
         : "运维任务未授权此工具。仅可使用任务明确选择的查询工具。",
     );

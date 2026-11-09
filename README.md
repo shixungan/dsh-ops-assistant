@@ -6,7 +6,7 @@ DSH 运维管理插件：持续采集告警 → 本地保存 → 按巡检周期
 
 目标：DeepSeek Harness **0.2.1-rc.5** Web profile，Ubuntu 24.04，Node.js 22.19 或更高。插件在 DSH 左侧增加“运维管理”，包括告警接入、巡检任务、分析报告和可选 IM 投递。
 
-0.1.2 是供联调的试用版，新增持续采集与本地巡检，已通过本地构建和 51 项自动测试。此前版本已验证真实 rc.5 的加载、页面和 API。尚未完成生产监控、模型及飞书机器人的端到端验收；验证范围见 [验证记录](docs/VALIDATION.md)。
+0.1.3 是供联调的试用版，在持续采集与本地巡检基础上增加 AI 回复的格式修正和原文诊断，已通过本地构建和 79 项自动测试。此前版本已验证真实 rc.5 的加载、页面和 API。尚未完成生产监控、模型及飞书机器人的端到端验收；验证范围见 [验证记录](docs/VALIDATION.md)。
 
 ## 已实现
 
@@ -31,7 +31,7 @@ DSH 运维管理插件：持续采集告警 → 本地保存 → 按巡检周期
 ```bash
 dsh --version
 node --version
-dsh plugin --profile web add -w https://github.com/shixungan/dsh-ops-assistant/releases/download/v0.1.2/dsh-ops-assistant-0.1.2.tgz --registry=https://registry.npmmirror.com
+dsh plugin --profile web add -w https://github.com/shixungan/dsh-ops-assistant/releases/download/v0.1.3/dsh-ops-assistant-0.1.3.tgz --registry=https://registry.npmmirror.com
 ```
 
 这个安装包已包含构建好的页面，没有运行时 npm 第三方依赖，不需要拉源码构建。无法在线下载时，可将 `.tgz` 上传到服务器，再把上面的 URL 换成该文件的绝对路径。随后按你当前的方式重启 DSH 服务并刷新浏览器；开发测试环境也可启动 `dsh web --no-open`。如果实际 profile 不是 `web`，将命令中的 profile 替换为你实际使用的 profile。
@@ -87,6 +87,8 @@ DSH-IM 是可选依赖。不安装时告警采集和本地报告照常可用。�
 **原封不动的范围**：API 返回的单条告警 JSON 对象原样保存于 `raw`，Zabbix 恢复事件存于 `recoveryRaw`；夜莺不采集恢复记录。外层加来源和索引。没有保存 HTTP 响应的字节级排版、请求头或 Token。
 
 **分析覆盖**：后端校验输入 ID 是否全部出现在输出事件里，能够检出漏项/编造 ID；这不证明模型对每条告警的推理都正确。请用已知事件和人工报告评估关联质量。
+
+**分析回复格式**：DSH 完成对话后，插件还需校验最终回复。若 JSON 语法错误，会尝试一次独立的格式修正，修正会话禁用全部工具并沿用任务总超时。仅接受补充结构标点、双引号转义或调整字符串外空白；不接受改写正文或补写被截断的内容。缺失/编造告警 ID、结构校验失败或修正失败仍标记分析失败，不作为完整报告投递。报告详情可查看、导出 AI 原始回复、修正回复及校验错误；重新分析会保留旧版本的回复。升级前生成的旧报告仍需按会话 ID 在 DSH 中查看回复。
 
 ## 运行与存储
 

@@ -142,7 +142,7 @@ export function createHandler({
       case "state":
         return {
           config,
-          runs: store.runs().map(({ alerts, report, ...run }) => ({
+          runs: store.runs().map(({ alerts, report, analysisOutputs, ...run }) => ({
             ...run,
             alertCount: alerts.length,
             summary: report?.summary,

@@ -1044,6 +1044,28 @@ export function OpsPanel({ call }) {
               <summary>分析会话 ID（可在 DSH 中追踪）</summary>
               <pre>{report.run.sessions.join("\n") || "暂无"}</pre>
             </details>
+            <details>
+              <summary>AI 原始回复与格式修正（{report.run.analysisOutputs?.length ?? 0}）</summary>
+              {report.run.analysisOutputs?.length ? (
+                <>
+                  <Button onClick={() => download(
+                    JSON.stringify(report.run.analysisOutputs, null, 2),
+                    `AI回复-${report.run.id}.json`, "application/json",
+                  )}>导出全部回复</Button>
+                  {report.run.analysisOutputs.map((output, index) => (
+                    <details key={index}>
+                      <summary>
+                        第 {output.version} 版 · {output.stage} · {output.kind === "format-repair" ? "格式修正" : "原始分析"}
+                        {" · "}{output.error ? "校验未通过" : "校验通过"}
+                      </summary>
+                      {output.sessionId && <p>会话：{output.sessionId}</p>}
+                      {output.error && <p>{output.error}</p>}
+                      <pre className="ops-raw">{output.text}</pre>
+                    </details>
+                  ))}
+                </>
+              ) : <p>尚无已保存的完整回复；旧报告可按会话 ID 在 DSH 中查看。</p>}
+            </details>
             {raw && (
               <div>
                 <div className="ops-section-title">
