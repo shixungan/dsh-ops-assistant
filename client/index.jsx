@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_INSTRUCTIONS } from "../src/analysis.mjs";
 import { coverageWarnings } from "../src/coverage.mjs";
 import { CSS } from "./styles.js";
@@ -105,6 +105,62 @@ function Empty({ children }) {
   return <div className="ops-empty">{children}</div>;
 }
 
+const deletionReason = (run) => run.deleteBlockedReason ||
+  (["queued", "collecting", "analyzing"].includes(run.status)
+    ? "记录正在执行，请先取消并等待结束" : null);
+
+function SelectionCheckbox({ partial = false, ...props }) {
+  const input = useRef(null);
+  useEffect(() => {
+    input.current.indeterminate = partial;
+  }, [partial]);
+  return <input ref={input} type="checkbox" aria-checked={partial ? "mixed" : props.checked} {...props} />;
+}
+
+function DeleteRunsDialog({ rows, busy, error, blocked, onCancel, onConfirm }) {
+  const dialog = useRef(null);
+  const titleId = React.useId();
+  const descriptionId = React.useId();
+  useEffect(() => {
+    dialog.current.showModal();
+  }, []);
+  return (
+    <dialog
+      ref={dialog}
+      className="ops-dialog ops-delete-dialog"
+      role="alertdialog"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!busy) onCancel();
+      }}
+    >
+      <h2 id={titleId}>删除 {rows.length} 条巡检记录？</h2>
+      <div id={descriptionId} className="ops-delete-description">
+        <p>将永久删除这些巡检记录、报告、原始告警快照、AI 回复及关联的本地 IM 投递记录，删除后无法恢复。</p>
+        <p>巡检任务配置、持续采集的告警库和 DSH 分析会话会保留。已发送的消息不会撤回，尚待投递的消息将停止投递。</p>
+      </div>
+      <ul className="ops-delete-items">
+        {rows.map((run) => (
+          <li key={run.id}>
+            <strong>{run.task.name}</strong>
+            <small>{time(run.start)} → {time(run.end)}</small>
+            <small>{run.id}</small>
+          </li>
+        ))}
+      </ul>
+      {(error || blocked) && <div role="alert" className="ops-notice ops-error">{error || blocked}</div>}
+      <div className="ops-actions ops-delete-actions">
+        <Button autoFocus disabled={busy} onClick={onCancel}>取消</Button>
+        <Button danger disabled={busy || !!blocked} onClick={onConfirm}>
+          {busy ? "正在删除…" : `确认删除 ${rows.length} 条`}
+        </Button>
+      </div>
+    </dialog>
+  );
+}
+
 export function OpsPanel({ call }) {
   const [state, setState] = useState(empty);
   const [tab, setTab] = useState("overview");
@@ -118,20 +174,33 @@ export function OpsPanel({ call }) {
   const [tools, setTools] = useState([]);
   const [report, setReport] = useState(null);
   const [raw, setRaw] = useState(null);
+  const [selectedRunIds, setSelectedRunIds] = useState([]);
+  const [deletion, setDeletion] = useState(null);
+  const [deleteError, setDeleteError] = useState("");
+  const deleting = useRef(false);
+  // Ignore a poll that began before a successful deletion, so it cannot put
+  // deleted records back into the list while the following refresh runs.
+  const stateEpoch = useRef(0);
   const refresh = useCallback(
-    async () => setState(await call("state", {})),
+    async () => {
+      const epoch = stateEpoch.current;
+      const value = await call("state", {});
+      if (epoch === stateEpoch.current) setState(value);
+    },
     [call],
   );
   useEffect(() => {
     let active = true;
-    const load = () =>
+    const load = () => {
+      const epoch = stateEpoch.current;
       call("state", {})
         .then((v) => {
-          if (active) setState(v);
+          if (active && epoch === stateEpoch.current) setState(v);
         })
         .catch((e) => {
           if (active) setError(e.message);
         });
+    };
     load();
     const timer = setInterval(load, 5000);
     return () => {
@@ -139,6 +208,13 @@ export function OpsPanel({ call }) {
       clearInterval(timer);
     };
   }, [call]);
+  useEffect(() => {
+    const eligible = new Set(state.runs.filter((run) => !deletionReason(run)).map((run) => run.id));
+    setSelectedRunIds((ids) => {
+      const remaining = ids.filter((id) => eligible.has(id));
+      return remaining.length === ids.length ? ids : remaining;
+    });
+  }, [state.runs]);
   async function act(action, success) {
     setBusy(true);
     setError("");
@@ -174,6 +250,52 @@ export function OpsPanel({ call }) {
       setRaw(null);
     }
   }
+  function requestDeletion(rows) {
+    if (busy || !rows.length) return;
+    setDeleteError("");
+    setDeletion(rows);
+  }
+  const deleteBlocked = deletion?.map((row) => {
+    const current = state.runs.find((run) => run.id === row.id);
+    return current ? deletionReason(current) : "所选记录已不在当前列表中，请取消后刷新并重新选择";
+  }).find(Boolean);
+  async function confirmDeletion() {
+    if (busy || deleting.current || !deletion?.length || deleteBlocked) return;
+    deleting.current = true;
+    setBusy(true);
+    setDeleteError("");
+    setError("");
+    setNotice("");
+    try {
+      const ids = deletion.map((run) => run.id);
+      const result = await call(ids.length === 1 ? "run.delete" : "run.deleteMany",
+        ids.length === 1 ? { id: ids[0] } : { ids });
+      const removed = new Set(result.deletedIds);
+      stateEpoch.current++;
+      setState((value) => ({
+        ...value,
+        runs: value.runs.filter((run) => !removed.has(run.id)),
+        deliveries: value.deliveries.filter((row) => !removed.has(row.runId)),
+      }));
+      setSelectedRunIds((current) => current.filter((id) => !removed.has(id)));
+      if (report && removed.has(report.run.id)) {
+        setReport(null);
+        setRaw(null);
+      }
+      setDeletion(null);
+      setNotice(`已删除 ${result.deletedCount} 条巡检记录及关联的本地报告、投递记录`);
+      try {
+        await refresh();
+      } catch (e) {
+        setError(`删除已成功，但刷新列表失败：${e.message}`);
+      }
+    } catch (e) {
+      setDeleteError(e.message);
+    } finally {
+      deleting.current = false;
+      setBusy(false);
+    }
+  }
   function download(text, filename, type = "text/plain;charset=utf-8") {
     const url = URL.createObjectURL(new Blob([text], { type }));
     const a = document.createElement("a");
@@ -185,11 +307,40 @@ export function OpsPanel({ call }) {
   const activeRuns = state.runs.filter((r) =>
     ["queued", "collecting", "analyzing"].includes(r.status),
   );
-  const showRuns = (rows) => (
-    <div className="ops-table-wrap">
+  const showRuns = (rows, selectable = false) => {
+    const eligible = rows.filter((run) => !deletionReason(run));
+    const selected = eligible.filter((run) => selectedRunIds.includes(run.id));
+    return (
+    <div>
+      {selectable && (
+        <div className="ops-run-selection">
+          <div>
+            <strong>已选 {selected.length} 条</strong>
+            <small>当前列表显示最近 {rows.length} 条；全选仅选择当前列表中可删除的记录。</small>
+          </div>
+          <div className="ops-actions">
+            <Button disabled={busy || !selected.length} onClick={() => setSelectedRunIds([])}>清空选择</Button>
+            <Button danger disabled={busy || !selected.length} onClick={() => requestDeletion(selected)}>
+              批量删除{selected.length ? `（${selected.length}）` : ""}
+            </Button>
+          </div>
+        </div>
+      )}
+      <div className="ops-table-wrap">
       <table>
         <thead>
           <tr>
+            {selectable && (
+              <th className="ops-selection-cell">
+                <SelectionCheckbox
+                  aria-label="全选当前列表中可删除的巡检记录"
+                  checked={eligible.length > 0 && selected.length === eligible.length}
+                  partial={selected.length > 0 && selected.length < eligible.length}
+                  disabled={busy || !eligible.length}
+                  onChange={(event) => setSelectedRunIds(event.target.checked ? eligible.map((run) => run.id) : [])}
+                />
+              </th>
+            )}
             <th>巡检任务 / 时间窗</th>
             <th>告警</th>
             <th>分析状态</th>
@@ -199,6 +350,19 @@ export function OpsPanel({ call }) {
         <tbody>
           {rows.map((run) => (
             <tr key={run.id}>
+              {selectable && (
+                <td className="ops-selection-cell">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择巡检记录：${run.task.name}，${run.id}`}
+                    title={deletionReason(run) ?? undefined}
+                    checked={!deletionReason(run) && selectedRunIds.includes(run.id)}
+                    disabled={busy || !!deletionReason(run)}
+                    onChange={(event) => setSelectedRunIds((ids) => event.target.checked
+                      ? [...new Set([...ids, run.id])] : ids.filter((id) => id !== run.id))}
+                  />
+                </td>
+              )}
               <td>
                 <strong>{run.task.name}</strong>
                 <small>
@@ -219,7 +383,7 @@ export function OpsPanel({ call }) {
               </td>
               <td>
                 <div className="ops-actions">
-                  <Button onClick={() => openReport(run.id)}>查看报告</Button>
+                  <Button disabled={busy} onClick={() => openReport(run.id)}>查看报告</Button>
                   {["queued", "collecting", "analyzing"].includes(
                     run.status,
                   ) ? (
@@ -248,7 +412,14 @@ export function OpsPanel({ call }) {
                       重新分析
                     </Button>
                   )}
+                  <Button
+                    danger
+                    disabled={busy || !!deletionReason(run)}
+                    title={deletionReason(run) ?? undefined}
+                    onClick={() => requestDeletion([run])}
+                  >删除</Button>
                 </div>
+                {deletionReason(run) && <small className="ops-delete-blocked">{deletionReason(run)}</small>}
               </td>
             </tr>
           ))}
@@ -257,8 +428,10 @@ export function OpsPanel({ call }) {
       {!rows.length && (
         <Empty>尚无巡检记录。先添加告警源和任务，再运行一次。</Empty>
       )}
+      </div>
     </div>
-  );
+    );
+  };
 
   return (
     <div className="ops-root">
@@ -488,7 +661,7 @@ export function OpsPanel({ call }) {
               保留告警原文、分析会话和完整性记录
             </span>
           </div>
-          {showRuns(state.runs)}
+          {showRuns(state.runs, true)}
         </section>
       )}
       {tab === "deliveries" && (
@@ -986,6 +1159,16 @@ export function OpsPanel({ call }) {
             </div>
           </form>
         </div>
+      )}
+      {deletion && (
+        <DeleteRunsDialog
+          rows={deletion}
+          busy={busy}
+          error={deleteError}
+          blocked={deleteBlocked}
+          onCancel={() => setDeletion(null)}
+          onConfirm={confirmDeletion}
+        />
       )}
       {report && (
         <div className="ops-overlay">

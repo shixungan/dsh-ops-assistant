@@ -147,6 +147,7 @@ export function createHandler({
             alertCount: alerts.length,
             summary: report?.summary,
             coveredCount: report?.coveredIds.length ?? 0,
+            deleteBlockedReason: engine.runDeletionReason?.(run) ?? null,
           })),
           deliveries: store.deliveries().map(({ text, ...row }) => row),
           pollStatus: engine.sourceStatus?.() ?? {},
@@ -259,6 +260,12 @@ export function createHandler({
         return { accepted: true };
       case "run.retry":
         return engine.retry(payload.id);
+      case "run.delete":
+        signal?.throwIfAborted();
+        return engine.deleteRuns([payload.id]);
+      case "run.deleteMany":
+        signal?.throwIfAborted();
+        return engine.deleteRuns(payload.ids);
       case "run.deliver":
         return await engine.deliver(payload.id) ?? { accepted: true };
       case "delivery.retry":

@@ -17,6 +17,7 @@ export class Engine {
     this.polling = false;
     this.tickBusy = false;
     this.sending = new Set();
+    this.delivering = new Set();
     this.closed = false;
     this.lifecycle = new AbortController();
     this.deliveryPromises = new Set();
@@ -368,6 +369,33 @@ export class Engine {
       }
     }
   }
+  runDeletionReason(run) {
+    if (!run) return "巡检记录不存在";
+    if (["queued", "collecting", "analyzing"].includes(run.status) ||
+        this.current?.id === run.id || this.queue.includes(run.id))
+      return "巡检仍在排队或执行，请先取消并等待结束";
+    if (!["completed", "failed", "cancelled", "interrupted"].includes(run.status))
+      return "巡检状态尚不支持删除，请刷新后重试";
+    if (this.delivering.has(run.id) || this.store.hasSendingDelivery(run.id) ||
+        [...this.sending].some((id) => this.store.delivery(id)?.runId === run.id))
+      return "报告正在投递，请等待投递结束";
+    return null;
+  }
+  deleteRuns(ids) {
+    if (this.closed || this.paused) throw new Error("服务正在停止或迁移，请稍后再试");
+    if (!Array.isArray(ids) || !ids.length || ids.length > 100 ||
+        ids.some((id) => typeof id !== "string" || !id.trim() ||
+          id !== id.trim() || id.length > 200))
+      throw new Error("请选择 1–100 条有效的巡检记录");
+    const uniqueIds = [...new Set(ids)];
+    // Validate the whole selection before the synchronous transaction. No
+    // awaits here: a retry, scheduler tick or delivery cannot interleave.
+    for (const id of uniqueIds) {
+      const reason = this.runDeletionReason(this.store.run(id));
+      if (reason) throw new Error(`${reason}；本次未删除任何记录`);
+    }
+    return this.store.deleteRuns(uniqueIds);
+  }
   async deliver(id) {
     const run = this.store.run(id);
     if (!run || ["queued", "collecting", "analyzing"].includes(run.status))
@@ -375,27 +403,33 @@ export class Engine {
     if (noAlerts(run)) return skippedEmptyReport();
     if (run.task.deliveryMode === "off")
       throw new Error("此任务未开启 IM 推送");
-    for (const target of run.task.targets) {
-      const key = createHash("sha256")
-        .update(
-          JSON.stringify([run.id, run.version, target.botId, target.targetId]),
-        )
-        .digest("hex");
-      if (this.store.delivery(key)) continue;
-      const row = {
-        id: key,
-        runId: run.id,
-        version: run.version,
-        ...target,
-        alertCount: run.alerts.length,
-        text: deliveryText(run),
-        format: "markdown",
-        status: "pending",
-        attempts: 0,
-        createdAt: this.now(),
-      };
-      this.store.putDelivery(row);
-      await this.sendDelivery(row);
+    if (this.delivering.has(id)) throw new Error("报告正在投递，请稍后再试");
+    this.delivering.add(id);
+    try {
+      for (const target of run.task.targets) {
+        const key = createHash("sha256")
+          .update(
+            JSON.stringify([run.id, run.version, target.botId, target.targetId]),
+          )
+          .digest("hex");
+        if (this.store.delivery(key)) continue;
+        const row = {
+          id: key,
+          runId: run.id,
+          version: run.version,
+          ...target,
+          alertCount: run.alerts.length,
+          text: deliveryText(run),
+          format: "markdown",
+          status: "pending",
+          attempts: 0,
+          createdAt: this.now(),
+        };
+        this.store.putDelivery(row);
+        await this.sendDelivery(row);
+      }
+    } finally {
+      this.delivering.delete(id);
     }
   }
   sendDelivery(row) {
@@ -407,8 +441,12 @@ export class Engine {
     return promise;
   }
   async sendDeliveryAttempt(row) {
-    if (this.closed || this.sending.has(row.id) ||
-        ["accepted", "unknown", "skipped"].includes(row.status)) return;
+    // A scheduler tick can hold an old snapshot across another delivery's
+    // await. Re-read before sending so deleted records stay deleted and a
+    // stale pending snapshot cannot resend an already accepted message.
+    row = this.store.delivery(row.id);
+    if (!row || this.closed || this.paused || this.sending.has(row.id) ||
+        row.status !== "pending") return;
     this.sending.add(row.id);
     try {
       // Pending messages created by an older version must obey the same quiet
@@ -486,6 +524,7 @@ export class Engine {
       return skippedEmptyReport();
     row.status = "pending";
     row.nextAttempt = this.now();
+    this.store.putDelivery(row);
     return await this.sendDelivery(row);
   }
   report(id) {

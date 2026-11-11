@@ -25,6 +25,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, window_start INTEGER NOT NULL, window_end INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE(task_id,window_start,window_end));
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS deliveries_run_status ON deliveries(json_extract(data, '$.runId'), json_extract(data, '$.status'));
       CREATE TABLE IF NOT EXISTS observations (source_id TEXT NOT NULL, event_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(source_id,event_key));
       CREATE TABLE IF NOT EXISTS alert_events (source_id TEXT NOT NULL, event_id TEXT NOT NULL, event_time INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(source_id,event_id));
       CREATE INDEX IF NOT EXISTS alert_events_source_time ON alert_events(source_id,event_time);
@@ -66,6 +67,33 @@ export class Store {
       .prepare("SELECT data FROM runs ORDER BY window_end DESC LIMIT ?")
       .all(limit)
       .map((r) => JSON.parse(r.data));
+  }
+  hasSendingDelivery(runId) {
+    return !!this.db.prepare(
+      "SELECT 1 FROM deliveries WHERE json_extract(data, '$.runId')=? AND json_extract(data, '$.status')='sending' LIMIT 1",
+    ).get(runId);
+  }
+  deleteRuns(ids) {
+    // Report snapshots and every delivery version belong to the run. The
+    // independent alert history and collector cursors are intentionally kept.
+    const deleteDeliveries = this.db.prepare(
+      "DELETE FROM deliveries WHERE json_extract(data, '$.runId')=?",
+    );
+    const deleteRun = this.db.prepare("DELETE FROM runs WHERE id=?");
+    const deletedIds = [...new Set(ids)];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const id of deletedIds) {
+        deleteDeliveries.run(id);
+        if (deleteRun.run(id).changes !== 1)
+          throw new Error("部分巡检记录已不存在，请刷新列表后重试");
+      }
+      this.db.exec("COMMIT");
+      return { deletedIds, deletedCount: deletedIds.length };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
   putDelivery(row) {
     this.db
