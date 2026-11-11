@@ -321,7 +321,7 @@ export class Engine {
         this.store.putRun(run);
       };
       progress.session = (id) => {
-        run.sessions.push(id);
+        if (!run.sessions.includes(id)) run.sessions.push(id);
         this.store.putRun(run);
       };
       run.report = await analyzeRun(

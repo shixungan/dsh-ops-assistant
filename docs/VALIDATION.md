@@ -66,11 +66,23 @@
 - Headless Edge 中运行真实 React 页面与模拟 RPC，22 项交互断言通过：默认聚焦取消、取消不发请求、单条删除、全选排除活动记录、防止重复提交、失败保留确认框、轮询清理选择以及删除后关闭报告与原文。已检查 1400×1100 页面截图；这不替代生产 DSH 的端到端验证。
 - 新增功能使用本地模拟数据与投递服务验证，未删除用户生产数据、未向真实 IM 发送消息。DSH 0.2.2-rc.1 的完整宿主联调尚未完成。
 
+## 0.1.7 本地格式修正与分析会话复用
+
+- 2026-11-11 在 Windows / Node.js 25.5.0 执行 `npm run check`，页面构建及 166 项自动测试通过。
+- 本地修复验证缺失容器闭合、完整 PromQL 标签选择器引号转义、保留转义与字段顺序，并拒绝截断正文/值、歧义引号、缺逗号/冒号、额外文本和超限输入；保留原有逐字内容和告警 ID 校验。
+- 用户提供的格式修正请求内 `previousOutput` 在内存回放，仅需补 1 个 `]`，本地处理约 1.2ms；原模型格式修正耗时 3分33秒。该结果是本地格式处理测试，不代表生产模型整体耗时；附件及真实资产内容没有进入仓库。
+- 验证同一执行上下文跨分批复用一个会话、重新分析独立、策略不叠加、会话失效不绕过工具限制、并发请求拒绝、取消与同步异常清理；零告警完整/不足/失败均不调用模型。
+- 验证默认 8 次/自定义 0–50 次查询预算，按工具执行 token 计数，PTC 内层调用分别计费、传输本身不计；预算跨分批共享，不影响未授权工具拦截。预算耗尽限制查询次数，未承诺固定总响应时长。
+- Headless Edge 真实 React 页面与模拟 RPC 的 17 项交互断言通过：新旧任务默认预算、输入范围、保存 0 与自定义次数、本地/旧版 AI 修正标签、耗时和累计补查次数，以及旧报告缺字段兼容；已检查截图布局。
+- 核对 DSH 0.2.2-rc.1 的 sessionController.create/prompt/rename、ToolExecution.token 和 guard/restrict 契约，rc.5 同样具备所用工具策略接口。测试使用模拟 Host 与预设回复，未在用户的生产模型和真实 MCP 上测量新版整轮耗时；未修改其模型、自动化任务或历史会话。
+
 ## 公开接口依据
 
 - [DSH rc.5 Session Controller](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/index.ts)：`create`、`prompt`、`cancel`。
 - [DSH rc.5 会话请求类型](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/types.ts)：`cwd`、`agentPreset`、`requestId`、`mode`、`content`。
 - [DSH rc.5 工具权限](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/core/tools/src/index.ts)：Agent scope 下 `restrict` 和最终 `guard`。
+- [DSH 0.2.2-rc.1 会话接口](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/api/session-controller/src/types.ts)：按 sessionId 顺序提交 prompt；[会话命令](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/api/session-controller/src/commands.ts)提供 rename。
+- [DSH 0.2.2-rc.1 工具执行标识](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/core/tools/src/contracts.ts)：token 区分实际调用，rootCallId 可由 PTC 子调用共享；[工具流水线](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/core/tools/src/pipeline.ts)在执行前检查 guard。
 - [DSH-IM v5.10.0 主动投递](https://github.com/xmanrui/dsh-im/blob/v5.10.0/PROACTIVE_DELIVERY.md)：本机 `listBots`、`listTargets`、`send`；不假定带投递幂等键或自动重试。
 - [DSH-IM v5.10.0 Markdown 卡片](https://github.com/xmanrui/dsh-im/blob/v5.10.0/src/channels/feishu/feishu-runtime.mjs#L726)：Markdown 文本发送为飞书 interactive 卡片；[官方测试](https://github.com/xmanrui/dsh-im/blob/v5.10.0/test/channels/feishu/proactive-markdown.test.mjs#L58)验证格式和单次投递。
 - [DSH-IM 客户端插件构建示例](https://github.com/xmanrui/dsh-im/blob/v5.10.0/plugin-src/client/build.mjs)：客户端模块装载格式；本项目按该接口独立实现。

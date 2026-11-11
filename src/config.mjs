@@ -80,6 +80,7 @@ export function taskConfig(input, sources, existing) {
     enabled: input.enabled === true,
     intervalMinutes: integer(input.intervalMinutes ?? 30, 5, 1440, "周期分钟"),
     timeoutMinutes: integer(input.timeoutMinutes ?? 15, 1, 60, "分析超时分钟"),
+    maxToolCalls: integer(input.maxToolCalls ?? existing?.maxToolCalls ?? 8, 0, 50, "补查工具调用上限"),
     maxBatchChars: integer(
       input.maxBatchChars ?? 20000,
       2000,

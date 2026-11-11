@@ -45,6 +45,7 @@ const freshTask = () => ({
   sourceIds: [],
   intervalMinutes: 30,
   timeoutMinutes: 15,
+  maxToolCalls: 8,
   maxBatchChars: 20000,
   workspace: "/opt/dsh-ops-assistant",
   agentPreset: "",
@@ -1059,8 +1060,20 @@ export function OpsPanel({ call }) {
                   />
                 </Field>
                 <Field
+                  title="每轮补查工具调用上限"
+                  hint="默认 8 次，所有分批共用；0 表示仅分析告警原文。达到上限后基于已有证据收束，未确认内容保留为未知。"
+                >
+                  <input
+                    type="number"
+                    min="0"
+                    max="50"
+                    value={task.maxToolCalls ?? 8}
+                    onChange={(e) => setTaskField("maxToolCalls", Number(e.target.value))}
+                  />
+                </Field>
+                <Field
                   title="单批告警字符预算"
-                  hint="超量自动分批；单条原文超限会报错，不会静默截断。"
+                  hint="超量自动分批，在同一分析会话内完成；单条原文超限会报错，不会静默截断。"
                 >
                   <input
                     type="number"
@@ -1244,10 +1257,12 @@ export function OpsPanel({ call }) {
                   {report.run.analysisOutputs.map((output, index) => (
                     <details key={index}>
                       <summary>
-                        第 {output.version} 版 · {output.stage} · {output.kind === "format-repair" ? "格式修正" : "原始分析"}
+                        第 {output.version} 版 · {output.stage} · {output.kind === "local-format-repair" ? "本地格式修正（未调用 AI）" : output.kind === "format-repair" ? "AI 格式修正（旧版本）" : "原始分析"}
                         {" · "}{output.error ? "校验未通过" : "校验通过"}
+                        {Number.isFinite(output.elapsedMs) && ` · 耗时 ${output.elapsedMs < 1000 ? `${output.elapsedMs} 毫秒` : `${Math.round(output.elapsedMs / 1000)} 秒`}`}
                       </summary>
                       {output.sessionId && <p>会话：{output.sessionId}</p>}
+                      {Number.isInteger(output.toolCalls) && <p>本轮累计补查：{output.toolCalls} 次</p>}
                       {output.error && <p>{output.error}</p>}
                       <pre className="ops-raw">{output.text}</pre>
                     </details>

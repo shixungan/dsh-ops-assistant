@@ -26,6 +26,8 @@ const output = (ids) => JSON.stringify(document(ids));
 const malformed = (ids) => output(ids)
   .replaceAll('\\"test\\"', '"test"')
   .replace(/\]\}\]\}$/, "}]}");
+const missingBracket = (text) => text.replace(/\]\}\]\}$/, "}]}");
+const truncated = '{"summary":"已观察到告警，但文本尚未结束';
 const makeRun = (ids = ["s:1"]) => ({
   id: "run-format", taskId: task.id, task: structuredClone(task),
   start: 0, end: 2000, version: 1, sessions: [],
@@ -43,7 +45,7 @@ function progressFor(run) {
   return progress;
 }
 
-test("malformed quotes and a missing array bracket receive one tool-free format retry", async () => {
+test("malformed PromQL quotes and a missing array bracket are repaired locally without another model session", async () => {
   const run = makeRun();
   const progress = progressFor(run);
   const signal = new AbortController().signal;
@@ -51,36 +53,30 @@ test("malformed quotes and a missing array bracket receive one tool-free format 
   const valid = output();
   assert.throws(() => JSON.parse(raw), SyntaxError);
   let calls = 0;
-  const report = await analyzeRun(run, task, async (prompt, options, receivedSignal, onSession) => {
+  const report = await analyzeRun(run, task, async (_prompt, options, receivedSignal, onSession) => {
     assert.equal(receivedSignal, signal);
     onSession(`session-${++calls}`);
-    if (calls === 1) {
-      assert.deepEqual(options.allowedTools, ["read_metrics"]);
-      return raw;
-    }
-    assert.equal(calls, 2);
-    assert.equal(options.formatOnly, true);
-    assert.deepEqual(options.allowedTools, []);
+    assert.equal(calls, 1, "local format repair must not ask the model again");
+    assert.deepEqual(options.allowedTools, ["read_metrics"]);
     assert.equal(options.workspace, task.workspace);
-    assert.ok(prompt.includes(JSON.stringify(raw)));
-    assert.equal(run.analysisOutputs[0].text, raw, "failure is saved before repair starts");
-    assert.ok(run.analysisOutputs[0].error);
-    return valid;
+    return raw;
   }, signal, progress);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   assert.deepEqual(report, parseAnalysis(valid, ["s:1"]));
   assert.equal(report.incidents[0].evidence[0], `原文指标：${query}`);
-  assert.deepEqual(run.sessions, ["session-1", "session-2"]);
+  assert.deepEqual(run.sessions, ["session-1"]);
   assert.deepEqual(run.analysisOutputs.map((row) => row.text), [raw, valid]);
-  assert.deepEqual(run.analysisOutputs.map((row) => row.kind), ["analysis", "format-repair"]);
-  assert.deepEqual(run.analysisOutputs.map((row) => row.sessionId), ["session-1", "session-2"]);
+  assert.deepEqual(run.analysisOutputs.map((row) => row.kind), ["analysis", "local-format-repair"]);
+  assert.deepEqual(run.analysisOutputs.map((row) => row.sessionId), ["session-1", "session-1"]);
   assert.ok(run.analysisOutputs.every((row) => row.version === 1));
+  assert.ok(run.analysisOutputs.every((row) => Number.isFinite(row.elapsedMs) && row.elapsedMs >= 0));
+  assert.ok(run.analysisOutputs[0].error);
   assert.equal(run.analysisOutputs[1].error, null);
   assert.ok(progress.updates.some((update) => update.analysisOutputs?.length === 1));
   assert.deepEqual(task.allowedTools, ["read_metrics"], "repair must not mutate task tool permissions");
 });
 
-test("valid output is saved and parsed without a format retry", async () => {
+test("valid output is saved and parsed without a local repair", async () => {
   const run = makeRun();
   let calls = 0;
   await analyzeRun(run, task, async () => { calls++; return output(); },
@@ -91,16 +87,17 @@ test("valid output is saved and parsed without a format retry", async () => {
   assert.equal(run.analysisOutputs[0].error, null);
 });
 
-test("a second malformed reply fails without a third attempt and retains both replies", async () => {
+test("truncated content fails after one model call and retains its original reply", async () => {
   const run = makeRun();
   let calls = 0;
   await assert.rejects(analyzeRun(run, task, async () => {
     calls++;
-    return malformed();
-  }, new AbortController().signal, progressFor(run)), /自动修正后仍未通过校验/);
-  assert.equal(calls, 2);
-  assert.equal(run.analysisOutputs.length, 2);
-  assert.ok(run.analysisOutputs.every((row) => row.error && row.text === malformed()));
+    return truncated;
+  }, new AbortController().signal, progressFor(run)));
+  assert.equal(calls, 1);
+  assert.equal(run.analysisOutputs.length, 1);
+  assert.equal(run.analysisOutputs[0].text, truncated);
+  assert.ok(run.analysisOutputs[0].error);
 });
 
 test("schema defects and missing or fabricated IDs are not retried as syntax errors", async (t) => {
@@ -120,35 +117,36 @@ test("schema defects and missing or fabricated IDs are not retried as syntax err
   });
 });
 
-test("format repair still rejects omitted IDs, invented IDs and invalid schemas", async (t) => {
-  for (const [label, repaired] of [
-    ["omitted", JSON.stringify({ summary: "不完整", incidents: [] })],
-    ["invented", output(["s:invented"])],
-    ["schema", JSON.stringify({ ...document(), incidents: [{ ...document().incidents[0], actions: "query" }] })],
+test("local syntax repair cannot bypass missing IDs, invented IDs or schema validation", async (t) => {
+  for (const [label, ids, raw] of [
+    ["omitted", ["s:1", "s:2"], missingBracket(output(["s:1"]))],
+    ["invented", ["s:1"], missingBracket(output(["s:invented"]))],
+    ["schema", ["s:1"], missingBracket(JSON.stringify({ ...document(), incidents: [{ ...document().incidents[0], actions: [3] }] }))],
   ]) await t.test(label, async () => {
-    const run = makeRun();
+    const run = makeRun(ids);
     let calls = 0;
-    await assert.rejects(analyzeRun(run, task, async () => ++calls === 1 ? malformed() : repaired,
-      new AbortController().signal, progressFor(run)), /自动修正后仍未通过校验/);
-    assert.equal(calls, 2);
-    assert.equal(run.analysisOutputs[1].text, repaired);
-    assert.ok(run.analysisOutputs[1].error);
+    await assert.rejects(analyzeRun(run, task, async () => { calls++; return raw; },
+      new AbortController().signal, progressFor(run)));
+    assert.equal(calls, 1);
+    assert.equal(run.analysisOutputs[0].text, raw);
+    assert.ok(run.analysisOutputs[0].error);
   });
 });
 
-test("format repair cannot rewrite conclusions or add evidence even with matching IDs", async (t) => {
-  for (const field of ["assessment", "evidence"]) await t.test(field, async () => {
-    const run = makeRun();
-    const changed = document();
-    if (field === "assessment") changed.incidents[0].assessment = "已证实设备故障";
-    else changed.incidents[0].evidence.push("新增但未经查询验证的事实");
-    let calls = 0;
-    await assert.rejects(analyzeRun(run, task, async () => ++calls === 1 ? malformed() : JSON.stringify(changed),
-      new AbortController().signal, progressFor(run)), /格式修正改变了原回复内容/);
-    assert.equal(calls, 2);
-    assert.equal(run.analysisOutputs[1].text, JSON.stringify(changed));
-    assert.ok(run.analysisOutputs[1].error);
-  });
+test("a local bracket repair preserves all conclusions, evidence, uncertainty and suggestions", async () => {
+  const run = makeRun();
+  const originalDocument = document();
+  originalDocument.incidents[0].assessment = "关联尚未证实；值为 0 不代表正常。";
+  originalDocument.incidents[0].evidence.push("空格  和换行\n保持原样");
+  const valid = JSON.stringify(originalDocument);
+  let calls = 0;
+  const report = await analyzeRun(run, task, async () => {
+    calls++;
+    assert.equal(calls, 1);
+    return missingBracket(valid);
+  }, new AbortController().signal, progressFor(run));
+  assert.deepEqual(report, parseAnalysis(valid, ["s:1"]));
+  assert.equal(run.analysisOutputs[1].text, valid);
 });
 
 test("cancellation after a complete malformed reply preserves it and starts no repair", async () => {
@@ -166,19 +164,24 @@ test("cancellation after a complete malformed reply preserves it and starts no r
   assert.equal(run.analysisOutputs[0].error, reason.message);
 });
 
-test("cancellation during format repair propagates without accepting the repaired report", async () => {
+test("cancellation after persisting the original reply prevents local repair and further sessions", async () => {
   const run = makeRun();
   const control = new AbortController();
-  const reason = new Error("repair timed out");
+  const reason = new Error("cancel before local repair");
   let calls = 0;
+  const record = progressFor(run);
+  const progress = (update) => {
+    record(update);
+    if (update.analysisOutputs?.length === 1) control.abort(reason);
+  };
+  progress.session = record.session;
   await assert.rejects(analyzeRun(run, task, async () => {
-    if (++calls === 1) return malformed();
-    control.abort(reason);
-    return output();
-  }, control.signal, progressFor(run)), (error) => error === reason);
-  assert.equal(calls, 2);
-  assert.equal(run.analysisOutputs[1].text, output());
-  assert.equal(run.analysisOutputs[1].error, reason.message);
+    calls++;
+    return malformed();
+  }, control.signal, progress), (error) => error === reason);
+  assert.equal(calls, 1);
+  assert.equal(run.analysisOutputs.length, 1);
+  assert.equal(run.analysisOutputs[0].text, malformed());
 });
 
 test("an analyzer failure before a reply is not treated as a reply syntax error", async () => {
@@ -191,22 +194,38 @@ test("an analyzer failure before a reply is not treated as a reply syntax error"
   assert.equal(run.analysisOutputs?.length ?? 0, 0);
 });
 
-test("a malformed cross-batch merge is repaired while retaining all input IDs", async () => {
+test("a malformed cross-batch merge is repaired locally with no fourth model turn", async () => {
   const run = makeRun(["s:1", "s:2"]);
   for (const alert of run.alerts) alert.raw = { detail: "x".repeat(700) };
   const options = { ...task, maxBatchChars: 1200 };
   let calls = 0;
-  const replies = [output(["s:1"]), output(["s:2"]), malformed(["s:1", "s:2"]), output(["s:1", "s:2"])];
+  const replies = [output(["s:1"]), output(["s:2"]), malformed(["s:1", "s:2"])];
   const report = await analyzeRun(run, options, async (_, receivedTask) => {
     calls++;
-    assert.equal(receivedTask.formatOnly === true, calls === 4);
+    assert.notEqual(receivedTask.formatOnly, true);
+    assert.ok(calls <= replies.length);
     return replies[calls - 1];
   }, new AbortController().signal, progressFor(run));
-  assert.equal(calls, 4);
+  assert.equal(calls, 3);
   assert.deepEqual(report.coveredIds, ["s:1", "s:2"]);
   assert.equal(run.analysisOutputs[2].stage, "跨批次关联分析");
   assert.equal(run.analysisOutputs[3].stage, "跨批次关联分析");
-  assert.equal(run.analysisOutputs[3].kind, "format-repair");
+  assert.equal(run.analysisOutputs[3].kind, "local-format-repair");
+});
+
+test("empty alert windows create no analysis session even when a selected source failed", async (t) => {
+  for (const status of ["ok", "partial", "failed"]) await t.test(status, async () => {
+    const run = makeRun([]);
+    run.sources[0].status = status;
+    let calls = 0;
+    const report = await analyzeRun(run, task, async () => { calls++; throw new Error("empty window must stay local"); },
+      new AbortController().signal, progressFor(run));
+    assert.equal(calls, 0);
+    assert.deepEqual(run.sessions, []);
+    assert.equal(run.analysisOutputs, undefined);
+    assert.deepEqual(report.coveredIds, []);
+    if (status !== "ok") assert.match(report.summary, /不能判定无异常/);
+  });
 });
 
 test("format-only DSH sessions deny the run_code transport as well as all query tools", async () => {
@@ -235,7 +254,7 @@ test("format-only DSH sessions deny the run_code transport as well as all query 
   assert.equal(listener, null);
 });
 
-test("failed repair persists both replies, sends only the fallback once, and omits raw replies from list state", async () => {
+test("unrepairable output is retained after one model turn and sends only the fallback once", async () => {
   const store = new Store(":memory:");
   const run = makeRun();
   run.task = { ...task, deliveryMode: "auto", targets: [{ botId: "b", targetId: "g" }], sendDataOnFailure: true };
@@ -247,16 +266,16 @@ test("failed repair persists both replies, sends only the fallback once, and omi
   const sent = [];
   const engine = new Engine({
     store,
-    analyze: async (_, __, ___, onSession) => { onSession(`session-${++calls}`); return malformed(); },
+    analyze: async (_, __, ___, onSession) => { onSession(`session-${++calls}`); return truncated; },
     getIm: () => ({ send: async (_, __, text) => { sent.push(text); return { sent: true }; } }),
   });
   try {
     await engine.execute(run);
     const saved = store.run(run.id);
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
     assert.equal(saved.status, "failed");
-    assert.equal(saved.analysisOutputs.length, 2);
-    assert.ok(saved.analysisOutputs.every((row) => row.text === malformed()));
+    assert.equal(saved.analysisOutputs.length, 1);
+    assert.equal(saved.analysisOutputs[0].text, truncated);
     assert.equal(sent.length, 1);
     assert.match(sent[0], /AI 分析未完成/);
     assert.doesNotMatch(sent[0], /AI 分析完成/);
@@ -272,7 +291,7 @@ test("failed repair persists both replies, sends only the fallback once, and omi
     await engine.drainPromise;
     const retried = store.run(run.id);
     assert.equal(retried.status, "completed");
-    assert.deepEqual(retried.analysisOutputs.map((row) => row.version), [1, 1, 2]);
+    assert.deepEqual(retried.analysisOutputs.map((row) => row.version), [1, 2]);
   } finally {
     await engine.close();
     store.close();
