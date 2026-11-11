@@ -29,8 +29,8 @@ test("local coverage exposes the actual head and tail gaps for selected sources"
     alerts: [], sources: [{ ...source, ...result, count: 0 }],
     report: { summary: "可见数据无告警", coveredIds: [] },
   });
-  assert.match(text, /夜莺：窗口前段未覆盖 745 秒，窗口末尾待采集 28 秒/);
-  assert.doesNotMatch(text, /Zabbix|Prometheus/);
+  assert.match(text, /本次数据不完整，结论仅针对已收到的告警/);
+  assert.doesNotMatch(text, /夜莺|Zabbix|Prometheus|745 秒|28 秒/);
 });
 
 test("initial collection, failures, snapshots and legacy reports retain truthful warnings", (t) => {

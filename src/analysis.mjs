@@ -45,6 +45,8 @@ export function parseAnalysis(text, expectedIds) {
     !Array.isArray(report.incidents)
   )
     throw new Error("分析结果缺少 summary 或 incidents");
+  if (Object.hasOwn(report, "correlation") && typeof report.correlation !== "string")
+    throw new Error("事件关联分析 correlation 须为文本");
   const expected = new Set(expectedIds);
   const covered = new Set();
   for (const event of report.incidents) {
@@ -77,18 +79,25 @@ export function parseAnalysis(text, expectedIds) {
     );
   return {
     summary: report.summary,
+    ...(typeof report.correlation === "string" ? { correlation: report.correlation } : {}),
     incidents: report.incidents,
     coveredIds: [...covered],
   };
 }
 
 const outputContract = `最终仅输出 JSON，不要 Markdown 围栏：
-{"summary":"概览","incidents":[{"title":"事件名称","alertIds":["输入中的 ID"],"assessment":"事实、关联判断及不确定性","evidence":["具体事实、时间或文档来源"],"unknowns":["尚未验证的内容"],"actions":["建议的下一步查询或人工动作"]}]}
+{"summary":"直接给结论","correlation":"事件间关联判断及依据或证据缺口","incidents":[{"title":"事件名称","alertIds":["输入中的 ID"],"assessment":"事件事实、原因判断及关键不确定性","evidence":["具体事实、时间或文档来源"],"unknowns":["尚未验证的内容"],"actions":["建议的下一步查询或人工动作"]}]}
 覆盖所有输入 alertId，不得编造 ID。建议只是建议，不代表已执行。
 字符串内的双引号、反斜杠和换行必须按 JSON 规则转义，例如：${JSON.stringify({ evidence: ['ping_percent_packet_loss{project="idc-idc"} > 5'] })}。
 输出前检查每个数组的 ] 和每个对象的 } 都已正确闭合。`;
 
-const summaryStyle = "summary 用 2–3 句概括异常、影响及结论的不确定性。每个事件 assessment 简洁，evidence 保留最多 5 条关键证据，unknowns 和 actions 各最多 3 条；每条尽量不超过 120 字。不要复述整段原文、完整资产清单、无关设备历史或检索过程；原文已由系统完整保存。精简文字不能遗漏告警 ID，也不能隐藏证据缺口或把假设升级为事实。";
+const summaryStyle = `报告用于简短巡检通知，直接表达业务含义：
+summary 不超过 100 字，先写异常和影响，再写根因结论或关键未确认项，不以来源、窗口内告警数量或分析过程开头。
+每个事件 title 用端点或业务对象加现象命名；assessment 不超过 140 字，只写该事件的事实、原因判断及必要的不确定性，避免重复结论或堆砌原始字段。
+correlation 不超过 120 字，单独说明事件间的共同影响、上下游或重复观测关系及依据；缺少证据就写无法确认。只有一条告警时说明无跨事件关联依据；一个事件合并了多条告警时可说明合并依据，不得因事件数为一就否定告警之间的关联。时间接近不能证明同一根因。
+actions 每个事件最多 3 条，每条不超过 60 字，用清晰动作描述核查对象和目的，例如“核对两端资产及接入交换机”“检查链路接口错误、丢弃和抖动记录”；不要直接输出数据库表名或 SQL。
+summary、assessment、correlation 和 actions 不写 PromQL、JSON 原文、数据库表名、ISO 时间戳、检索过程或查询预算；必要时间用北京时间。技术细节和证据来源留在 evidence，证据缺口及必要的查询限制原因留在 unknowns。
+evidence 保留最多 5 条关键证据，unknowns 最多 3 条，每条尽量不超过 120 字。不要复述整段原文、完整资产清单或无关设备历史；原文已由系统完整保存。精简文字不能遗漏告警 ID，也不能隐藏证据缺口或把假设升级为事实。`;
 
 function queryPolicy(task) {
   return `本轮采用有限补查：所有分批和合并共用最多 ${task.maxToolCalls} 次已授权查询，已用 ${task.analysisContext.toolCallsUsed} 次；run_code 内的每个查询分别计数。
@@ -234,5 +243,7 @@ export function reportMarkdown(run) {
       "下一步：",
       ...event.actions.map((v) => `- ${v}`),
     );
+  if (run.report?.correlation?.trim())
+    data.push("", "## 事件关联分析", run.report.correlation);
   return data.join("\n");
 }

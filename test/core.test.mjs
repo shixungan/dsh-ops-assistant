@@ -438,7 +438,7 @@ test("missing output IDs fail analysis and auto-deliver explicitly labelled data
   const r = engine.enqueue(t, 10000, 20000);
   await engine.drainPromise;
   assert.equal(store.run(r.id).status, "failed");
-  assert.match(text, /AI 分析未完成/);
+  assert.match(text, /分析未完成/);
   assert.equal(store.deliveries()[0].status, "accepted");
   await engine.close();
   store.close();
@@ -491,8 +491,8 @@ test("summary messages are bounded and clearly label incompleteness", () => {
   r.sources[0].status = "partial";
   const text = deliveryText(r);
   assert.ok(text.length <= 3500);
-  assert.match(text, /所选来源的时间窗尚未完整覆盖/);
-  assert.match(text, /摘要已缩短/);
+  assert.match(text, /本次数据不完整，结论仅针对已收到的告警/);
+  assert.match(text, /结论较长，请按巡检 ID 查看完整判断/);
 });
 test("host handler never returns saved tokens to browser state", async () => {
   const store = new Store(":memory:");

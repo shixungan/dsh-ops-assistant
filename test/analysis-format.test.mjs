@@ -277,7 +277,7 @@ test("unrepairable output is retained after one model turn and sends only the fa
     assert.equal(saved.analysisOutputs.length, 1);
     assert.equal(saved.analysisOutputs[0].text, truncated);
     assert.equal(sent.length, 1);
-    assert.match(sent[0], /AI 分析未完成/);
+    assert.match(sent[0], /分析未完成/);
     assert.doesNotMatch(sent[0], /AI 分析完成/);
     assert.equal(store.deliveries()[0].status, "accepted");
     const handler = createHandler({ store, engine, credentials: {}, getIm: () => null });

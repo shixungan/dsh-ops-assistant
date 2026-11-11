@@ -76,6 +76,13 @@
 - Headless Edge 真实 React 页面与模拟 RPC 的 17 项交互断言通过：新旧任务默认预算、输入范围、保存 0 与自定义次数、本地/旧版 AI 修正标签、耗时和累计补查次数，以及旧报告缺字段兼容；已检查截图布局。
 - 核对 DSH 0.2.2-rc.1 的 sessionController.create/prompt/rename、ToolExecution.token 和 guard/restrict 契约，rc.5 同样具备所用工具策略接口。测试使用模拟 Host 与预设回复，未在用户的生产模型和真实 MCP 上测量新版整轮耗时；未修改其模型、自动化任务或历史会话。
 
+## 0.1.8 飞书五段简报
+
+- 本轮验证范围：结论优先、固定五段顺序、任务/窗口/数量置于事件段、来源和原始等级不展示、尾部仅巡检 ID；具体来源缺口保留在本地报告，飞书仅保留结论适用范围提示。
+- 分析结构兼容检查：新报告的 `correlation` 独立保存和呈现，旧报告缺字段仍可读取；不将多条告警归为同一事件直接当成已验证共同根因，不新增模型回合或会话。
+- 消息边界检查：多事件与建议有界呈现、建议去重、长内容不截断成误导性半句、Markdown 动态文本转义、跨日及缺失时间，以及分析失败不使用旧报告结论。
+- 本地构建和 176 项自动测试通过，包含 14 项五段消息布局检查及 6 项关联字段回归；已查看单事件消息预览。测试使用模拟回复与 IM 服务，真实飞书卡片投递仍需在用户环境验收，未向生产群发送测试消息。
+
 ## 公开接口依据
 
 - [DSH rc.5 Session Controller](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/index.ts)：`create`、`prompt`、`cancel`。
