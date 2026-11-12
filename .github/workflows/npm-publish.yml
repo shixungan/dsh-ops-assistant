@@ -24,7 +24,6 @@ jobs:
       cancel-in-progress: false
     env:
       PUBLISH_VERSION: ${{ inputs.version }}
-      RELEASE_DIR: ${{ runner.temp }}/ops-npm-release
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,6 +34,8 @@ jobs:
           node-version: '24.x'
       - name: Download and verify release identity
         uses: actions/github-script@v7
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/ops-npm-release
         with:
           script: |
             const fs = require('node:fs/promises');
@@ -80,6 +81,8 @@ jobs:
             }));
       - name: Publish the verified archive with npm Trusted Publishing
         # npm package settings must trust this workflow. No long-lived npm token is used.
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/ops-npm-release
         run: node scripts/publish-npm-release.mjs
       - name: Synchronize and verify the domestic mirror
         run: node scripts/sync-npmmirror.mjs dsh-ops-assistant "$PUBLISH_VERSION"
