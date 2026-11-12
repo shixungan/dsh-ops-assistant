@@ -39,6 +39,16 @@ dsh plugin --profile web add -w https://github.com/shixungan/dsh-ops-assistant/r
 
 不必重复启动第二个 DSH 实例。已有 systemd 服务时，重启已有服务；本项目没有假定你的服务单元名称。
 
+### 国内源安装（待首次发布）
+
+npm 发布与国内镜像同步流程已准备，**当前尚未完成首次 npm 发布及镜像下载校验**。完成后，可按包名安装或升级，不再请求 GitHub Release 下载地址：
+
+```bash
+dsh plugin --profile web add -w dsh-ops-assistant@0.1.9 --registry=https://registry.npmmirror.com
+```
+
+`npmmirror` 是 npm 官方仓库的只读镜像，不能直接接收 GitHub 安装包；给 GitHub 直链添加 `--registry` 也不会代理该文件。维护者的首次发布、Trusted Publisher 配置和同步验证见 [npm 与国内镜像发布](docs/NPM-PUBLISH.md)。
+
 ### 从早期原型迁移
 
 若已安装此前的 `dsh-ops-manager`，先停用旧插件，避免两个实例同时运行。新包名和默认数据目录均为 `dsh-ops-assistant`；若要沿用原型的数据库，在新插件中将 `dataDir` 指向原目录 `$DSH_HOME/integrations/dsh-ops-manager`。先备份数据库，不要让两个插件同时打开它。

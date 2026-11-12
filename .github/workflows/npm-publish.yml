@@ -1,0 +1,85 @@
+name: Publish npm and sync domestic mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing GitHub Release version, without v (for example 0.1.9)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'shixungan/dsh-ops-assistant' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    env:
+      PUBLISH_VERSION: ${{ inputs.version }}
+      RELEASE_DIR: ${{ runner.temp }}/ops-npm-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Download and verify release identity
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs/promises');
+            const path = require('node:path');
+            const version = process.env.PUBLISH_VERSION;
+            if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+              throw new Error('Version must be x.y.z without v');
+            }
+            const repo = context.repo;
+            const tag = `v${version}`;
+            const { data: release } = await github.rest.repos.getReleaseByTag({ ...repo, tag });
+            if (release.draft || release.tag_name !== tag) throw new Error('Release is not published');
+            let { data: ref } = await github.rest.git.getRef({ ...repo, ref: `tags/${tag}` });
+            let object = ref.object;
+            for (let depth = 0; object.type === 'tag' && depth < 5; depth++) {
+              object = (await github.rest.git.getTag({ ...repo, tag_sha: object.sha })).data.object;
+            }
+            if (object.type !== 'commit') throw new Error('Release tag must resolve to a commit');
+            // Releases created by this repository's CI record the immutable commit SHA.
+            if (!/^[a-f0-9]{40}$/.test(release.target_commitish) || object.sha !== release.target_commitish) {
+              throw new Error('Release commit and tag disagree; inspect before publishing');
+            }
+            const { data: source } = await github.rest.repos.getContent({ ...repo, path: 'package.json', ref: object.sha });
+            if (source.type !== 'file' || source.encoding !== 'base64') throw new Error('Source manifest unavailable');
+            const sourceManifest = JSON.parse(Buffer.from(source.content, 'base64').toString('utf8'));
+            const filename = `dsh-ops-assistant-${version}.tgz`;
+            const dir = process.env.RELEASE_DIR;
+            await fs.mkdir(dir, { recursive: true });
+            for (const name of [filename, 'SHA256SUMS.txt']) {
+              const assets = release.assets.filter(asset => asset.name === name && asset.state === 'uploaded');
+              if (assets.length !== 1 || assets[0].size <= 0 || assets[0].size > 32 * 1024 * 1024) {
+                throw new Error(`Missing or invalid release asset: ${name}`);
+              }
+              const result = await github.rest.repos.getReleaseAsset({
+                ...repo, asset_id: assets[0].id, headers: { accept: 'application/octet-stream' }
+              });
+              const bytes = Buffer.from(result.data);
+              if (bytes.length !== assets[0].size) throw new Error(`Incomplete download: ${name}`);
+              await fs.writeFile(path.join(dir, name), bytes);
+            }
+            await fs.writeFile(path.join(dir, 'release.json'), JSON.stringify({
+              repository: `${repo.owner}/${repo.repo}`, tag, commit: object.sha, sourceManifest
+            }));
+      - name: Publish the verified archive with npm Trusted Publishing
+        # npm package settings must trust this workflow. No long-lived npm token is used.
+        run: node scripts/publish-npm-release.mjs
+      - name: Synchronize and verify the domestic mirror
+        run: node scripts/sync-npmmirror.mjs dsh-ops-assistant "$PUBLISH_VERSION"
