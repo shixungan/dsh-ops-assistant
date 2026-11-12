@@ -83,6 +83,14 @@
 - 消息边界检查：多事件与建议有界呈现、建议去重、长内容不截断成误导性半句、Markdown 动态文本转义、跨日及缺失时间，以及分析失败不使用旧报告结论。
 - 本地构建和 176 项自动测试通过，包含 14 项五段消息布局检查及 6 项关联字段回归；已查看单事件消息预览。测试使用模拟回复与 IM 服务，真实飞书卡片投递仍需在用户环境验收，未向生产群发送测试消息。
 
+## 0.1.9 飞书卡片排版
+
+- 本轮验证范围：飞书 / Lark 使用五段蓝色标签、分隔线、灰色辅助文字与固定动作序号，其他渠道继续使用通用 Markdown；结论仍置顶，尾部仅巡检 ID。
+- 边界检查包括动态内容实体转义、禁止告警内容注入卡片标签或提及、完整保留否定与条件句、待核实事项省略计数、消息长度与单事件序号，以及零告警静默和投递幂等。
+- 核对 DSH-IM v5.10.0 的公开契约：`format: "markdown"` 将正文置入 Card 2.0 的 Markdown 组件，以 `interactive` 消息发送；不提供自定义卡头或任意卡片 JSON 入参。样式复用此接口，无需新增 Webhook，也不增加模型回合。
+- 本地构建和 199 项自动测试通过，包括 12 项卡片格式回归和飞书 / Lark / 非飞书渠道路由、重启后旧正文保留及不确定结果不补发检查。已检查桌面和窄屏的本地样式模拟图，窄屏未出现横向溢出。
+- 自动测试和本地预览使用模拟报告与 IM 服务；预览图不是飞书客户端截图，真实飞书渲染及投递仍需在用户环境验收，本轮未向生产群发送测试消息。
+
 ## 公开接口依据
 
 - [DSH rc.5 Session Controller](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/api/session-controller/src/index.ts)：`create`、`prompt`、`cancel`。
@@ -92,6 +100,7 @@
 - [DSH 0.2.2-rc.1 工具执行标识](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/core/tools/src/contracts.ts)：token 区分实际调用，rootCallId 可由 PTC 子调用共享；[工具流水线](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/core/tools/src/pipeline.ts)在执行前检查 guard。
 - [DSH-IM v5.10.0 主动投递](https://github.com/xmanrui/dsh-im/blob/v5.10.0/PROACTIVE_DELIVERY.md)：本机 `listBots`、`listTargets`、`send`；不假定带投递幂等键或自动重试。
 - [DSH-IM v5.10.0 Markdown 卡片](https://github.com/xmanrui/dsh-im/blob/v5.10.0/src/channels/feishu/feishu-runtime.mjs#L726)：Markdown 文本发送为飞书 interactive 卡片；[官方测试](https://github.com/xmanrui/dsh-im/blob/v5.10.0/test/channels/feishu/proactive-markdown.test.mjs#L58)验证格式和单次投递。
+- [飞书 Card 2.0 富文本语法](https://open.feishu.cn/document/feishu-cards/feishu-card-cardkit/components/markdown?lang=zh-CN)：分区标签、彩色文字、分隔线与 Markdown 标题。
 - [DSH-IM 客户端插件构建示例](https://github.com/xmanrui/dsh-im/blob/v5.10.0/plugin-src/client/build.mjs)：客户端模块装载格式；本项目按该接口独立实现。
 - [Zabbix 7.0 event.get](https://www.zabbix.com/documentation/7.0/en/manual/api/reference/event/get)：历史问题时间窗和 eventid 游标。
 - [夜莺官方 API 说明](https://flashcat.cloud/docs/content/flashcat-monitor/nightingale-v9/usecase/api/)：个人 Token 使用 `X-User-Token`，需开启 `HTTP.TokenAuth.Enable`。

@@ -1,6 +1,6 @@
 {
   "name": "dsh-ops-assistant",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "DSH 运维管理：告警接入、定时分析、报告与可选 DSH-IM 投递",
   "repository": {
     "type": "git",

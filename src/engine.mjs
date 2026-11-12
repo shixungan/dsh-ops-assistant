@@ -3,6 +3,7 @@ import {
   ensureIngestion, ingestSource, collectLocalSource, localSourceInfo,
 } from "./ingestion.mjs";
 import { analyzeRun, deliveryText, reportMarkdown } from "./analysis.mjs";
+import { deliveryFeishuText } from "./delivery.mjs";
 import { credentialRef } from "./config.mjs";
 
 const noAlerts = (run) => Array.isArray(run?.alerts) && run.alerts.length === 0;
@@ -419,7 +420,8 @@ export class Engine {
           version: run.version,
           ...target,
           alertCount: run.alerts.length,
-          text: deliveryText(run),
+          text: ["feishu", "lark"].includes(target.channel)
+            ? deliveryFeishuText(run) : deliveryText(run),
           format: "markdown",
           status: "pending",
           attempts: 0,

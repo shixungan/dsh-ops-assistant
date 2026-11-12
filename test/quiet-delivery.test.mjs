@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Engine } from "../src/engine.mjs";
 import { Store } from "../src/store.mjs";
 import { taskConfig } from "../src/config.mjs";
+import { deliveryText, deliveryFeishuText } from "../src/delivery.mjs";
 
 const now = 3600000;
 const source = {
@@ -20,12 +21,15 @@ const report = {
     evidence: ["告警记录"], unknowns: ["缺少指标"], actions: ["查询指标"] }],
 };
 
-function fixture(t, { alerts = [], mode = "auto", sendDataOnFailure = true } = {}) {
+function fixture(t, {
+  alerts = [], mode = "auto", sendDataOnFailure = true, channel = "feishu",
+  respond = () => ({ sent: true }),
+} = {}) {
   const store = new Store(":memory:");
   const task = taskConfig({
     name: "半小时巡检", sourceIds: [source.id], intervalMinutes: 30,
     workspace: "/opt/ops", deliveryMode: mode, sendDataOnFailure,
-    targets: [{ botId: "test-bot", targetId: "test-group", channel: "feishu" }],
+    targets: [{ botId: "test-bot", targetId: "test-group", ...(channel ? { channel } : {}) }],
   }, [source]);
   store.saveSettings({ sources: [source], tasks: [task] });
   store.commitIngestion(source.id, alerts, {
@@ -41,7 +45,7 @@ function fixture(t, { alerts = [], mode = "auto", sendDataOnFailure = true } = {
     analyze: async () => JSON.stringify(report),
     getIm: () => {
       imLookups++;
-      return { send: async (...args) => { sent.push(args); return { sent: true }; } };
+      return { send: async (...args) => { sent.push(args); return respond(...args); } };
     },
   });
   t.after(async () => { await engine.close(); store.close(); });
@@ -157,15 +161,80 @@ test("a missing report is not treated as proof that a legacy message has no aler
 });
 
 test("new nonempty reports use Markdown and remain idempotent", async (t) => {
-  const f = fixture(t, { alerts: [alert], mode: "manual" });
-  f.store.putRun(f.savedRun());
-  await f.engine.deliver("run");
-  await f.engine.deliver("run");
-  assert.equal(f.sent.length, 1);
-  assert.equal(f.sent[0][3].format, "markdown");
-  assert.equal(f.store.deliveries()[0].format, "markdown");
-  assert.equal(f.store.deliveries()[0].alertCount, 1);
-  assert.equal(f.store.deliveries()[0].status, "accepted");
+  for (const channel of ["feishu", "lark", "slack", null]) await t.test(channel ?? "legacy without channel", async (t) => {
+    const f = fixture(t, { alerts: [alert], mode: "manual", channel });
+    const run = f.savedRun();
+    f.store.putRun(run);
+    await f.engine.deliver("run");
+    await f.engine.deliver("run");
+    assert.equal(f.sent.length, 1);
+    const [botId, targetId, text, options] = f.sent[0];
+    assert.equal(botId, "test-bot");
+    assert.equal(targetId, "test-group");
+    assert.equal(typeof text, "string", "DSH-IM expects text, not a custom card object");
+    assert.equal(options.format, "markdown", "DSH-IM wraps Markdown in a schema 2.0 interactive card for Feishu/Lark");
+    assert.ok(options.signal instanceof AbortSignal);
+    if (channel === "feishu" || channel === "lark") {
+      assert.equal(text, deliveryFeishuText(run));
+      assert.match(text, /<hr>/);
+      assert.match(text, /<text_tag color=/);
+    } else {
+      assert.equal(text, deliveryText(run));
+      assert.doesNotMatch(text, /<\/?(?:font|text_tag|hr)\b/);
+    }
+    const saved = f.store.deliveries()[0];
+    assert.equal(saved.text, text);
+    assert.equal(saved.format, "markdown");
+    assert.equal(saved.alertCount, 1);
+    assert.equal(saved.status, "accepted");
+  });
+});
+
+test("legacy pending nonempty messages preserve their saved text and format after restart", async (t) => {
+  for (const format of [undefined, "markdown"]) await t.test(format ?? "legacy plain", async (t) => {
+    const f = fixture(t, { alerts: [alert], mode: "manual" });
+    f.store.putRun(f.savedRun());
+    const original = "旧版正文\n\n**原结论**\n1. 第一项\n2. 第二项\n批次：run";
+    const row = {
+      id: "legacy-nonempty", runId: "run", version: 1, status: "pending", attempts: 0,
+      botId: "test-bot", targetId: "test-group", channel: "feishu", text: original,
+      ...(format ? { format } : {}), nextAttempt: now,
+    };
+    f.store.putDelivery(row);
+    f.engine.initialize();
+    await f.engine.tick();
+    await f.engine.pollPromise;
+    await f.engine.sendDelivery(row);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0][2], original);
+    assert.equal(f.sent[0][3].format, format ?? "plain");
+    assert.equal(f.store.delivery(row.id).text, original);
+    assert.equal(f.store.delivery(row.id).format, format);
+    assert.equal(f.store.delivery(row.id).status, "accepted");
+  });
+});
+
+test("card rejection or an unknown result never triggers a plain-text fallback or automatic resend", async (t) => {
+  for (const failure of ["target-rejected", "network-timeout", "unconfirmed"]) await t.test(failure, async (t) => {
+    const f = fixture(t, { alerts: [alert], mode: "manual", respond: () => {
+      if (failure === "unconfirmed") return { sent: false };
+      throw Object.assign(new Error("测试投递结果"), { code: failure });
+    } });
+    f.store.putRun(f.savedRun());
+    await f.engine.deliver("run");
+    const saved = f.store.deliveries()[0];
+    assert.equal(saved.status, failure === "target-rejected" ? "failed" : "unknown");
+    assert.equal(saved.attempts, 1);
+    assert.equal(saved.format, "markdown");
+    await f.engine.deliver("run");
+    await f.engine.tick();
+    await f.engine.pollPromise;
+    await f.engine.sendDelivery({ ...saved, status: "pending" });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0][2], saved.text);
+    assert.equal(f.sent[0][3].format, "markdown");
+    assert.deepEqual(f.store.delivery(saved.id), saved);
+  });
 });
 
 test("nonempty failed analysis still follows sendDataOnFailure", async (t) => {
