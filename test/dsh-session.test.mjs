@@ -2,9 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { createDshAnalyzer } from "../src/dsh.mjs";
-import { taskConfig } from "../src/config.mjs";
 
-const source = { id: "s", enabled: true };
 const task = { name: "测试巡检", sourceIds: ["s"], workspace: "/opt/ops", allowedTools: ["read_logs", "read_assets"] };
 const deferred = () => {
   let resolve;
@@ -50,7 +48,7 @@ function fixture() {
   const run = (prompt, options = {}, signal = new AbortController().signal, onSession = () => {}) =>
     analyze(prompt, { ...task, ...options }, signal, onSession);
   const guard = (id = "session-1") => agents.get(id).policies.guards[0];
-  return { ctx, agents, listeners, creates, prompts, renames, cancels, emit, complete, run, guard };
+  return { ctx, agents, listeners, creates, prompts, renames, cancels, emit, complete, run, guard, analyze };
 }
 
 test("one inspection context reuses its Session and policies across sequential prompts", async () => {
@@ -64,10 +62,10 @@ test("one inspection context reuses its Session and policies across sequential p
   assert.deepEqual(f.renames, [{ sessionId: "session-1", title: context.title }]);
   const policies = f.agents.get("session-1").policies;
   assert.equal(policies.guards.length, 1);
-  assert.deepEqual(policies.restrictions, [{ allow: task.allowedTools }]);
+  assert.deepEqual(policies.restrictions, [{ allow: [] }]);
   assert.equal(policies.released, 0, "opening the completed Session must not lift its read-only policy");
   assert.equal(f.listeners.size, 0);
-  assert.equal(context.callLimit, 8);
+  assert.equal(context.toolCallsUsed, 0);
 });
 
 test("different runs, retries and callers without a context create separate owned Sessions", async () => {
@@ -81,47 +79,30 @@ test("different runs, retries and callers without a context create separate owne
   assert.ok(f.creates.every((options) => !Object.hasOwn(options, "sessionId")));
 });
 
-test("query budget spans all prompts, counts inner executions and never counts PTC transport or unauthorized calls", async () => {
+test("legacy selections no longer expose raw tools, transport or session controls", async () => {
   const f = fixture(), context = {};
-  await f.run("first", { analysisContext: context, maxToolCalls: 2 });
-  const guard = f.guard();
-  const parent = { name: "run_code", token: Symbol("parent"), callId: "parent" };
-  assert.equal(guard(parent), undefined);
-  assert.match(guard({ name: "write_device", token: Symbol("forbidden") }), /未授权/);
+  await f.run("inspect", { analysisContext: context, allowedTools: ["read_logs", "bash", "subagent", "run_code"], maxToolCalls: 50 });
+  for (const name of ["read_logs", "bash", "subagent", "run_code", "ops_lookup"])
+    assert.equal(typeof f.guard()({ name, agent: f.agents.get("session-1"), token: Symbol(name) }), "string", name);
+  assert.deepEqual(f.agents.get("session-1").policies.restrictions, [{ allow: [] }]);
   assert.equal(context.toolCallsUsed, 0);
-  const first = { name: "read_logs", token: Symbol("first"), callId: "child", rootCallId: "parent" };
-  assert.equal(guard(first), undefined);
-  assert.equal(guard(first), undefined, "checking the same execution again does not spend budget twice");
-  assert.equal(context.toolCallsUsed, 1);
-  await f.run("merge", { analysisContext: context, maxToolCalls: 2 });
-  assert.equal(guard({ name: "read_assets", token: Symbol("second"), callId: "child", rootCallId: "parent" }), undefined);
-  assert.equal(context.toolCallsUsed, 2, "distinct execution tokens count even when call ids match");
-  assert.match(guard({ name: "read_logs", token: Symbol("third") }), /用完 2 次查询预算/);
-  assert.match(guard(parent), /直接输出最终 JSON/);
-  assert.equal(context.toolCallsUsed, 2);
+});
+
+test("evidence preparation and sequential analysis share one owned session", async () => {
+  const f = fixture(), context = {}, ids = [], options = { ...task, analysisContext: context };
+  const run = { id: "batch", start: 0, end: 1000, alerts: [{ title: "ping loss", host: "unknown" }] };
+  const evidence = await f.analyze.prepare(run, options, new AbortController().signal, (id) => ids.push(id));
+  assert.equal(f.prompts.length, 0, "prefetch does not ask the model to discover tools");
+  assert.equal(evidence.evidence[0].status, "unavailable");
+  await f.run("analysis", options, undefined, (id) => ids.push(id));
   assert.equal(f.creates.length, 1);
+  assert.deepEqual(ids, ["session-1", "session-1"]);
 });
 
-test("zero budget and legacy format-only mode refuse both queries and run_code", async () => {
+test("empty preparation never opens a session", async () => {
   const f = fixture();
-  const zero = {};
-  await f.run("zero", { analysisContext: zero, maxToolCalls: 0 });
-  for (const name of ["read_logs", "run_code"])
-    assert.match(f.guard()({ name, token: Symbol(name) }), /用完 0 次查询预算/);
-  assert.equal(zero.toolCallsUsed, 0);
-  await f.run("format", { formatOnly: true });
-  for (const name of ["read_logs", "run_code"])
-    assert.match(f.guard("session-2")({ name }), /格式修正会话不允许调用工具/);
-  assert.deepEqual(f.agents.get("session-2").policies.restrictions, [{ allow: [] }]);
-});
-
-test("tool execution identity falls back to callId without charging repeated guard checks", async () => {
-  const f = fixture(), context = {};
-  await f.run("first", { analysisContext: context, maxToolCalls: 1 });
-  assert.equal(f.guard()({ name: "read_logs", callId: "same" }), undefined);
-  assert.equal(f.guard()({ name: "read_logs", callId: "same" }), undefined);
-  assert.match(f.guard()({ name: "read_logs", callId: "different" }), /查询预算/);
-  assert.equal(context.toolCallsUsed, 1);
+  assert.equal(await f.analyze.prepare({ alerts: [] }, task, new AbortController().signal), null);
+  assert.equal(f.creates.length, 0);
 });
 
 test("missing or failing title support does not fail the analysis", async () => {
@@ -187,14 +168,4 @@ test("synchronous prompt failures clean up listeners and are not mistaken for a 
   await assert.rejects(f.run("question", {}, control.signal), /admission failed/);
   assert.equal(f.listeners.size, 0);
   assert.equal(getEventListeners(control.signal, "abort").length, 0);
-});
-
-test("query limit configuration defaults, preserves saved values and rejects out-of-range budgets", () => {
-  assert.equal(taskConfig(task, [source]).maxToolCalls, 8);
-  assert.equal(taskConfig({ ...task, maxToolCalls: 0 }, [source]).maxToolCalls, 0);
-  assert.equal(taskConfig({ ...task, maxToolCalls: 50 }, [source]).maxToolCalls, 50);
-  const existing = taskConfig({ ...task, maxToolCalls: 4 }, [source]);
-  assert.equal(taskConfig(task, [source], existing).maxToolCalls, 4);
-  for (const limit of [-1, 51, 1.5, "8"])
-    assert.throws(() => taskConfig({ ...task, maxToolCalls: limit }, [source]), /补查工具调用上限/);
 });

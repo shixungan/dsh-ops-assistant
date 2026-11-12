@@ -83,6 +83,8 @@ export class Engine {
       throw new Error("任务不存在或仍在执行");
     run.version++;
     run.report = null;
+    delete run.queryEvidence;
+    delete run.timings;
     run.error = null;
     run.analyzed = 0;
     run.status = "queued";
@@ -268,6 +270,8 @@ export class Engine {
       this.lifecycle.signal,
       AbortSignal.timeout(run.task.timeoutMinutes * 60000),
     ]);
+    const started = Date.now();
+    run.timings = {};
     try {
       if (!run.reuseRaw) {
         if (run.rolling) {
@@ -315,6 +319,7 @@ export class Engine {
         }
       }
       signal.throwIfAborted();
+      run.timings.collectionMs = Date.now() - started;
       run.status = "analyzing";
       this.store.putRun(run);
       const progress = (data) => {
@@ -347,6 +352,7 @@ export class Engine {
       run.stage = "分析未完成";
       run.finishedAt = this.now();
     } finally {
+      run.timings.totalMs = Date.now() - started;
       this.current = null;
       this.store.putRun(run);
     }

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_INSTRUCTIONS } from "../src/analysis.mjs";
 import { coverageWarnings } from "../src/coverage.mjs";
+import { QUERY_PLANS } from "../src/query-plan.mjs";
 import { CSS } from "./styles.js";
 import { DeliverySettings } from "./delivery-settings.jsx";
 export const name = "ops-assistant-ui";
@@ -40,22 +41,131 @@ const empty = {
   deliveries: [],
   pollStatus: {},
 };
+const planNames = Object.fromEntries(QUERY_PLANS.map((plan) => [plan.id, plan.name]));
+const freshQueryPlan = () => ({
+  id: "network-ping", version: 1, instructions: "",
+  bindings: { postgres: "", neo4j: "", knowledge: "", memory: "" },
+  assetCacheSeconds: 300, queryTimeoutSeconds: 15, maxSupplementaryCalls: 2,
+});
+const editQueryPlan = (value) => ({
+  ...freshQueryPlan(), ...value,
+  bindings: { ...freshQueryPlan().bindings, ...value?.bindings },
+});
+const duration = (ms) => Number.isFinite(ms)
+  ? (ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`) : "—";
 const freshTask = () => ({
   name: "每 30 分钟告警巡检",
   sourceIds: [],
   intervalMinutes: 30,
   timeoutMinutes: 15,
-  maxToolCalls: 8,
   maxBatchChars: 20000,
   workspace: "/opt/dsh-ops-assistant",
   agentPreset: "",
   instructions: DEFAULT_INSTRUCTIONS,
-  allowedTools: [],
+  queryPlan: freshQueryPlan(),
   enabled: false,
   deliveryMode: "off",
   targets: [],
   sendDataOnFailure: true,
 });
+
+function QueryPlanSettings({ value, onChange, tools }) {
+  const plan = editQueryPlan(value);
+  const set = (key, next) => onChange({ ...plan, [key]: next });
+  const roles = [
+    ["postgres", "资产与窗口事件", "PostgreSQL：批量归一 IP，并查询相关设备的窗口事件。"],
+    ["neo4j", "网络拓扑", "Neo4j：资产归一后查询交换机间的有界候选路径。"],
+    ["knowledge", "错误码说明", "WeKnora：仅在原告警含具体错误码且需要解释时补查。"],
+    ["memory", "已确认历史经验", "MemOS：仅补查本批次相关资产的历史经验，不能替代本次证据。"],
+  ];
+  return (
+    <section aria-label="查询方案">
+      <div className="ops-section-title">
+        <div><h3>查询方案</h3><p>先按方案取证，再交给 AI 分析。每个任务单独保存。</p></div>
+      </div>
+      <Field title="方案类型">
+        <select value={plan.id} onChange={(e) => set("id", e.target.value)}>
+          {Object.entries(planNames).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+        </select>
+      </Field>
+      <div className="ops-notice">
+        {plan.id === "network-ping"
+          ? "批量查询源/目的 IP → 归一接入交换机 → 定位候选路径 → 查询窗口事件。普通 ping 不自动检索厂商手册。"
+          : "优先整理原始告警及可识别资产；不把非网络告警套进 ping 路径分析。"}
+        <small>无法确认资产、路径或数据覆盖时保留证据缺口。当前拓扑不直接证明历史窗口内的实际流量路径。</small>
+      </div>
+      <details><summary>查看内置排查步骤</summary>
+        <pre className="ops-report">{QUERY_PLANS.find((item) => item.id === plan.id)?.instructions}</pre>
+      </details>
+      <div className="ops-form-grid">
+        {roles.map(([role, title, hint]) => {
+          const candidates = tools.filter((tool) => tool.roles?.includes(role));
+          const selected = plan.bindings[role];
+          return (
+            <Field key={role} title={title} hint={hint}>
+              <select value={selected} onChange={(e) => set("bindings", { ...plan.bindings, [role]: e.target.value })}>
+                <option value="">自动识别现有 MCP</option>
+                {!!selected && !candidates.some((tool) => tool.name === selected) &&
+                  <option value={selected}>{selected}（当前不可用）</option>}
+                {candidates.map((tool) => <option key={tool.name} value={tool.name}>{tool.name}</option>)}
+              </select>
+            </Field>
+          );
+        })}
+      </div>
+      <small>优先识别内置适配的 MCP；同优先级只有唯一匹配时才自动使用。缺失或不唯一会在报告中标明，需要时按用途指定工具。</small>
+      <div className="ops-form-grid">
+        <Field title="单次查询超时（秒）" hint="慢查询返回明确缺口，其他已完成的证据继续参与分析。">
+          <input type="number" min="1" max="60" value={plan.queryTimeoutSeconds}
+            onChange={(e) => set("queryTimeoutSeconds", Number(e.target.value))} />
+        </Field>
+        <Field title="资产映射缓存（秒）" hint="0 表示关闭跨轮缓存。仅复用短期资产映射；窗口事件与故障结论不跨轮复用。">
+          <input type="number" min="0" max="3600" value={plan.assetCacheSeconds}
+            onChange={(e) => set("assetCacheSeconds", Number(e.target.value))} />
+        </Field>
+        <Field title="AI 额外补查上限" hint="固定取证完成后，最多补查的次数；0 表示只分析原文与已取证据。">
+          <input type="number" min="0" max="6" value={plan.maxSupplementaryCalls}
+            onChange={(e) => set("maxSupplementaryCalls", Number(e.target.value))} />
+        </Field>
+      </div>
+      <Field title="方案补充说明（Markdown）" hint="填写哪些情况继续查询、何时停止和判定习惯；留空采用内置流程。说明随任务保存并注入分析，不会自动扩大查询范围。">
+        <textarea rows="7" maxLength={12000} value={plan.instructions}
+          placeholder="例如：只核对告警路径上的交换机；无端口事件时保留未知，不扩展无关设备；历史经验只用于提出待验证假设。"
+          onChange={(e) => set("instructions", e.target.value)} />
+      </Field>
+    </section>
+  );
+}
+
+function QueryEvidence({ value, runId }) {
+  if (!value) return <p className="ops-footnote">此报告没有查询方案执行记录。零告警会跳过查询，旧报告保持原样。</p>;
+  const queries = value.queries ?? [];
+  const statusLabels = { ok: "成功", failed: "失败", timeout: "超时", skipped: "跳过", unavailable: "不可用", cached: "缓存命中", partial: "部分结果" };
+  return (
+    <details open>
+      <summary>查询方案与耗时 · {value.plan?.name ?? planNames[value.plan?.id] ?? value.plan?.id ?? "—"} · v{value.plan?.version ?? 1}</summary>
+      <div className="ops-actions">
+        <small>取证耗时 {duration(value.elapsedMs)} · {queries.length} 条查询记录 · 缓存命中 {queries.filter((q) => q.cacheHit).length} 次</small>
+        <Button onClick={() => download(JSON.stringify(value, null, 2), `查询证据-${runId}.json`, "application/json")}>导出查询证据</Button>
+      </div>
+      {queries.length ? <div className="ops-table-wrap"><table>
+        <thead><tr><th>查询用途 / 工具</th><th>状态</th><th>耗时</th><th>返回条数 / 大小</th><th>说明</th></tr></thead>
+        <tbody>{queries.map((query, index) => <tr key={`${query.id ?? "query"}-${index}`}>
+          <td><strong>{query.purpose ?? query.id}</strong><small>{query.tool || "未匹配到工具"}</small></td>
+          <td><Badge status={query.status}>{query.cacheHit ? "缓存命中" : statusLabels[query.status] ?? query.status}</Badge></td>
+          <td>{duration(query.elapsedMs)}</td><td>{query.rowCount ?? "—"}<small>{Number.isFinite(query.resultBytes) ? `${(query.resultBytes / 1024).toFixed(1)} KB` : ""}</small></td>
+          <td>{query.note || query.error || "—"}</td>
+        </tr>)}</tbody>
+      </table></div> : <p>本轮没有执行补充查询。</p>}
+      {(value.evidence ?? []).some((item) => item.note) && <details>
+        <summary>证据范围与缺口说明</summary>
+        <ul>{value.evidence.filter((item) => item.note).map((item, index) =>
+          <li key={`${item.id}-${index}`}><strong>{item.purpose ?? item.id}：</strong>{item.note}</li>)}</ul>
+      </details>}
+      <small>取证与 AI 回复耗时分别记录；AI 回复阶段的时间包含其额外补查和模型处理，不能当作纯模型推理耗时。</small>
+    </details>
+  );
+}
 
 function Badge({ status, children }) {
   return (
@@ -233,7 +343,8 @@ export function OpsPanel({ call }) {
     }
   }
   async function editTask(value) {
-    setTask(structuredClone(value ?? freshTask()));
+    const { allowedTools: _legacyTools, maxToolCalls: _legacyBudget, ...next } = structuredClone(value ?? freshTask());
+    setTask({ ...next, queryPlan: editQueryPlan(next.queryPlan) });
     setTools(await call("tools.list", {}));
   }
   const setTaskField = (key, value) => setTask((t) => ({ ...t, [key]: value }));
@@ -632,7 +743,7 @@ export function OpsPanel({ call }) {
                 </p>
                 <small>
                   分析预设：{t.agentPreset || "使用 DSH 默认"} ·{" "}
-                  {t.allowedTools.length} 个授权补查工具
+                  查询方案：{planNames[t.queryPlan?.id ?? "network-ping"] ?? t.queryPlan?.id}
                 </small>
               </div>
               <div className="ops-actions">
@@ -1060,18 +1171,6 @@ export function OpsPanel({ call }) {
                   />
                 </Field>
                 <Field
-                  title="每轮补查工具调用上限"
-                  hint="默认 8 次，所有分批共用；0 表示仅分析告警原文。达到上限后基于已有证据收束，未确认内容保留为未知。"
-                >
-                  <input
-                    type="number"
-                    min="0"
-                    max="50"
-                    value={task.maxToolCalls ?? 8}
-                    onChange={(e) => setTaskField("maxToolCalls", Number(e.target.value))}
-                  />
-                </Field>
-                <Field
                   title="单批告警字符预算"
                   hint="超量自动分批，在同一分析会话内完成；单条原文超限会报错，不会静默截断。"
                 >
@@ -1124,46 +1223,13 @@ export function OpsPanel({ call }) {
                 />
               </div>
             </div>
-            <Field title="排查步骤（支持 Markdown，无需 SKILL 格式）">
+            <QueryPlanSettings value={task.queryPlan} onChange={(value) => setTaskField("queryPlan", value)} tools={tools} />
+            <Field title="报告补充要求（Markdown）" hint="补充业务背景、结论格式或人工判定习惯；查询路线在上方查询方案中维护。">
               <textarea
                 rows="8"
                 value={task.instructions}
                 onChange={(e) => setTaskField("instructions", e.target.value)}
               />
-            </Field>
-            <Field
-              title="允许补查的工具"
-              group
-              hint="只勾选只读的知识检索、历史记忆和监控查询工具。未选择时仅分析输入的告警原文。"
-            >
-              <div className="ops-tool-list">
-                {tools
-                  .filter((t) => t.name !== "run_code")
-                  .map((t) => (
-                    <label
-                      key={t.name}
-                      className="ops-check"
-                      title={t.description}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={task.allowedTools.includes(t.name)}
-                        onChange={(e) =>
-                          setTaskField(
-                            "allowedTools",
-                            e.target.checked
-                              ? [...task.allowedTools, t.name]
-                              : task.allowedTools.filter((x) => x !== t.name),
-                          )
-                        }
-                      />
-                      <span>{t.name}</span>
-                    </label>
-                  ))}
-                {!tools.length && (
-                  <small>没有发现可选工具；请先在 DSH 中接入 MCP。</small>
-                )}
-              </div>
             </Field>
             <div className="ops-sticky-footer">
               <button className="ops-button ops-primary" disabled={busy}>
@@ -1242,6 +1308,7 @@ export function OpsPanel({ call }) {
               )}
             </div>
             <pre className="ops-report">{report.markdown}</pre>
+            <QueryEvidence value={report.run.queryEvidence} runId={report.run.id} />
             <details>
               <summary>分析会话 ID（可在 DSH 中追踪）</summary>
               <pre>{report.run.sessions.join("\n") || "暂无"}</pre>

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { normalizeQueryPlan } from "./query-plan.mjs";
 const text = (v, label, max = 200) => {
   if (typeof v !== "string" || !v.trim() || v.length > max)
     throw new Error(`${label}不能为空且长度不得超过 ${max}`);
@@ -80,7 +81,7 @@ export function taskConfig(input, sources, existing) {
     enabled: input.enabled === true,
     intervalMinutes: integer(input.intervalMinutes ?? 30, 5, 1440, "周期分钟"),
     timeoutMinutes: integer(input.timeoutMinutes ?? 15, 1, 60, "分析超时分钟"),
-    maxToolCalls: integer(input.maxToolCalls ?? existing?.maxToolCalls ?? 8, 0, 50, "补查工具调用上限"),
+    queryPlan: normalizeQueryPlan(input.queryPlan, existing?.queryPlan),
     maxBatchChars: integer(
       input.maxBatchChars ?? 20000,
       2000,
@@ -94,9 +95,6 @@ export function taskConfig(input, sources, existing) {
       typeof input.instructions === "string"
         ? input.instructions.slice(0, 20000)
         : "",
-    allowedTools: [
-      ...new Set((input.allowedTools ?? []).map((n) => text(n, "工具名", 300))),
-    ],
     ...deliveryConfig(input),
     nextEnd: existing?.nextEnd ?? null,
     createdAt: existing?.createdAt ?? Date.now(),

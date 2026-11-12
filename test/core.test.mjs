@@ -568,9 +568,9 @@ test("DSH adapter subscribes before prompt and accepts only committed completed 
     () => {},
   );
   assert.equal(result, "final");
-  assert.deepEqual(restriction, { allow: ["read_logs"] });
-  assert.equal(guard({ name: "read_logs" }), undefined);
-  assert.match(guard({ name: "bash" }), /未授权/);
+  assert.deepEqual(restriction, { allow: [] });
+  assert.equal(typeof guard({ name: "read_logs" }), "string");
+  assert.equal(typeof guard({ name: "bash" }), "string");
   assert.equal(listener, null);
 });
 test("DSH cancellation propagates to owned session", async () => {

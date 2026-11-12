@@ -9,6 +9,7 @@ import {
 } from "./config.mjs";
 import { localSourceInfo } from "./ingestion.mjs";
 import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
+import { QUERY_ROLES, compatibleQueryTool, normalizeQueryPlan } from "./query-plan.mjs";
 
 export const name = "dsh-ops-assistant";
 export const inject = [
@@ -41,7 +42,7 @@ export async function apply(ctx, config = {}) {
     getTools: () =>
       ctx.tools
         .schemas()
-        .map((t) => ({ name: t.name, description: t.description })),
+        .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
   });
   ctx.effect(
     () =>
@@ -141,8 +142,8 @@ export function createHandler({
     switch (method) {
       case "state":
         return {
-          config,
-          runs: store.runs().map(({ alerts, report, analysisOutputs, ...run }) => ({
+          config: { ...config, tasks: config.tasks.map(({ allowedTools, maxToolCalls, ...task }) => ({ ...task, queryPlan: normalizeQueryPlan(task.queryPlan) })) },
+          runs: store.runs().map(({ alerts, report, analysisOutputs, queryEvidence, ...run }) => ({
             ...run,
             alertCount: alerts.length,
             summary: report?.summary,
@@ -275,7 +276,7 @@ export function createHandler({
       case "im.targets":
         return listTargets(getIm(), payload.botId);
       case "tools.list":
-        return getTools();
+        return getTools().map((tool) => ({ ...tool, roles: QUERY_ROLES.filter((role) => compatibleQueryTool(role, tool)) })).filter((tool) => tool.roles.length);
       default:
         throw new Error("未知管理操作");
     }

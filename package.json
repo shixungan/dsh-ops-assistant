@@ -1,6 +1,6 @@
 {
   "name": "dsh-ops-assistant",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "DSH 运维管理：告警接入、定时分析、报告与可选 DSH-IM 投递",
   "repository": {
     "type": "git",
@@ -46,6 +46,12 @@
     "test": "node --test test/*.test.mjs",
     "check": "npm run build && npm test",
     "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": { "optional": true }
   },
   "devDependencies": {
     "esbuild": "0.25.9",
