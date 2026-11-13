@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { taskConfig } from "../src/config.mjs";
 import { createHandler } from "../src/host.mjs";
 import { Store } from "../src/store.mjs";
+import { defaultQueryPlans } from "../src/plan-library.mjs";
 
 const sources = [{ id: "n9e", enabled: true }];
 const task = { name: "巡检", sourceIds: ["n9e"], workspace: "/opt/ops" };
@@ -14,9 +15,8 @@ test("legacy task saves replace hand-picked tool permissions with a default quer
   assert.equal(saved.enabled, true);
   assert.equal(saved.nextEnd, 123);
   assert.equal(saved.createdAt, 100);
-  assert.equal(saved.queryPlan.id, "network-ping");
-  assert.equal(saved.queryPlan.version, 1);
-  assert.equal(saved.queryPlan.maxSupplementaryCalls, 2);
+  assert.equal(saved.queryPlanId, "builtin-network-ping");
+  assert.equal(Object.hasOwn(saved, "queryPlan"), false);
   assert.equal(Object.hasOwn(saved, "allowedTools"), false);
   assert.equal(Object.hasOwn(saved, "maxToolCalls"), false);
   assert.equal(legacy.allowedTools[0], "bash");
@@ -35,17 +35,19 @@ test("tool discovery exposes compatible purpose bindings and invalid plans prese
   assert.deepEqual((await handler("tools.list")).map(({ name, roles }) => ({ name, roles })), [
     { name: pg.name, roles: ["postgres"] }, { name: graph.name, roles: ["neo4j"] }, { name: memory.name, roles: ["memory"] },
   ]);
-  await assert.rejects(handler("task.save", { ...saved, queryPlan: { id: "network-ping", queryTimeoutSeconds: -1 } }), /超时/);
+  await assert.rejects(handler("task.save", { ...saved, queryPlanId: "missing" }), /现有查询方案/);
+  await assert.rejects(handler("task.save", { ...saved, queryPlan: { id: "network-ping" } }), /任务只选择/);
   assert.deepEqual(store.getSettings().tasks, [saved]);
-  const updated = await handler("task.save", { ...saved, allowedTools: ["bash"], queryPlan: { id: "general-evidence" } });
-  assert.equal(updated.queryPlan.id, "general-evidence");
+  const updated = await handler("task.save", { ...saved, allowedTools: ["bash"], queryPlanId: "builtin-general-evidence" });
+  assert.equal(updated.queryPlanId, "builtin-general-evidence");
   assert.equal(Object.hasOwn(updated, "allowedTools"), false);
 });
 
 test("ordinary task edits preserve its query plan unless explicitly replaced", () => {
-  const initial = taskConfig({ ...task, queryPlan: { id: "general-evidence", instructions: "关注业务", assetCacheSeconds: 0, maxSupplementaryCalls: 1 } }, sources);
-  assert.deepEqual(taskConfig({ ...task, name: "新名称" }, sources, initial).queryPlan, initial.queryPlan);
-  assert.equal(taskConfig({ ...task, queryPlan: { id: "network-ping" } }, sources, initial).queryPlan.id, "network-ping");
+  const plans = defaultQueryPlans();
+  const initial = taskConfig({ ...task, queryPlanId: "builtin-general-evidence" }, sources, undefined, plans);
+  assert.equal(taskConfig({ ...task, name: "新名称" }, sources, initial, plans).queryPlanId, initial.queryPlanId);
+  assert.equal(taskConfig({ ...task, queryPlanId: "builtin-network-ping" }, sources, initial, plans).queryPlanId, "builtin-network-ping");
 });
 
 test("polling state omits query evidence while report detail retains it", async (t) => {

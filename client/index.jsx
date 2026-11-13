@@ -36,7 +36,7 @@ const time = (t) =>
       })
     : "—";
 const empty = {
-  config: { sources: [], tasks: [] },
+  config: { sources: [], tasks: [], queryPlans: [] },
   runs: [],
   deliveries: [],
   pollStatus: {},
@@ -62,7 +62,7 @@ const freshTask = () => ({
   workspace: "/opt/dsh-ops-assistant",
   agentPreset: "",
   instructions: DEFAULT_INSTRUCTIONS,
-  queryPlan: freshQueryPlan(),
+  queryPlanId: "",
   enabled: false,
   deliveryMode: "off",
   targets: [],
@@ -81,7 +81,7 @@ function QueryPlanSettings({ value, onChange, tools }) {
   return (
     <section aria-label="查询方案">
       <div className="ops-section-title">
-        <div><h3>查询方案</h3><p>先按方案取证，再交给 AI 分析。每个任务单独保存。</p></div>
+        <div><h3>取证流程与参数</h3><p>先按方案取证，再交给 AI 分析。可供多个巡检任务共用。</p></div>
       </div>
       <Field title="方案类型">
         <select value={plan.id} onChange={(e) => set("id", e.target.value)}>
@@ -128,7 +128,7 @@ function QueryPlanSettings({ value, onChange, tools }) {
             onChange={(e) => set("maxSupplementaryCalls", Number(e.target.value))} />
         </Field>
       </div>
-      <Field title="方案补充说明（Markdown）" hint="填写哪些情况继续查询、何时停止和判定习惯；留空采用内置流程。说明随任务保存并注入分析，不会自动扩大查询范围。">
+      <Field title="方案补充说明（Markdown）" hint="填写哪些情况继续查询、何时停止和判定习惯；留空采用内置流程。说明随方案保存并注入使用该方案的分析，不会自动扩大查询范围。">
         <textarea rows="7" maxLength={12000} value={plan.instructions}
           placeholder="例如：只核对告警路径上的交换机；无端口事件时保留未知，不扩展无关设备；历史经验只用于提出待验证假设。"
           onChange={(e) => set("instructions", e.target.value)} />
@@ -137,7 +137,7 @@ function QueryPlanSettings({ value, onChange, tools }) {
   );
 }
 
-function QueryEvidence({ value, runId }) {
+function QueryEvidence({ value, runId, onDownload }) {
   if (!value) return <p className="ops-footnote">此报告没有查询方案执行记录。零告警会跳过查询，旧报告保持原样。</p>;
   const queries = value.queries ?? [];
   const statusLabels = { ok: "成功", failed: "失败", timeout: "超时", skipped: "跳过", unavailable: "不可用", cached: "缓存命中", partial: "部分结果" };
@@ -146,7 +146,7 @@ function QueryEvidence({ value, runId }) {
       <summary>查询方案与耗时 · {value.plan?.name ?? planNames[value.plan?.id] ?? value.plan?.id ?? "—"} · v{value.plan?.version ?? 1}</summary>
       <div className="ops-actions">
         <small>取证耗时 {duration(value.elapsedMs)} · {queries.length} 条查询记录 · 缓存命中 {queries.filter((q) => q.cacheHit).length} 次</small>
-        <Button onClick={() => download(JSON.stringify(value, null, 2), `查询证据-${runId}.json`, "application/json")}>导出查询证据</Button>
+        <Button onClick={() => onDownload(JSON.stringify(value, null, 2), `查询证据-${runId}.json`, "application/json")}>导出查询证据</Button>
       </div>
       {queries.length ? <div className="ops-table-wrap"><table>
         <thead><tr><th>查询用途 / 工具</th><th>状态</th><th>耗时</th><th>返回条数 / 大小</th><th>说明</th></tr></thead>
@@ -272,6 +272,32 @@ function DeleteRunsDialog({ rows, busy, error, blocked, onCancel, onConfirm }) {
   );
 }
 
+function DeleteQueryPlanDialog({ plan, references, busy, error, onCancel, onConfirm }) {
+  const dialog = useRef(null);
+  const titleId = React.useId();
+  useEffect(() => { dialog.current.showModal(); }, []);
+  return (
+    <dialog ref={dialog} className="ops-dialog ops-delete-dialog" role="alertdialog"
+      aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}>
+      <h2 id={titleId}>删除查询方案“{plan.name}”？</h2>
+      <div className="ops-delete-description">
+        <p>将删除方案定义，无法直接恢复。排队、执行中的巡检和旧报告保留各自的方案快照。</p>
+        <p>修订 {plan.revision} · 当前被 {references.length} 个任务引用</p>
+      </div>
+      {references.length > 0 && <div className="ops-notice ops-error">
+        请先为这些任务更换方案：{references.map((item) => item.name).join("、")}
+      </div>}
+      {error && <div role="alert" className="ops-notice ops-error">{error}</div>}
+      <div className="ops-actions ops-delete-actions">
+        <Button autoFocus disabled={busy} onClick={onCancel}>取消</Button>
+        <Button danger disabled={busy || references.length > 0} onClick={onConfirm}>
+          {busy ? "正在删除…" : "确认删除方案"}
+        </Button>
+      </div>
+    </dialog>
+  );
+}
+
 export function OpsPanel({ call }) {
   const [state, setState] = useState(empty);
   const [tab, setTab] = useState("overview");
@@ -280,6 +306,10 @@ export function OpsPanel({ call }) {
   const [busy, setBusy] = useState(false);
   const [source, setSource] = useState(null);
   const [task, setTask] = useState(null);
+  const [planDraft, setPlanDraft] = useState(null);
+  const [planDeletion, setPlanDeletion] = useState(null);
+  const [planDeleteError, setPlanDeleteError] = useState("");
+  const planDeleting = useRef(false);
   const [deliveryTask, setDeliveryTask] = useState(null);
   const [dataDir, setDataDir] = useState(null);
   const [tools, setTools] = useState([]);
@@ -342,11 +372,37 @@ export function OpsPanel({ call }) {
       setBusy(false);
     }
   }
-  async function editTask(value) {
-    const { allowedTools: _legacyTools, maxToolCalls: _legacyBudget, ...next } = structuredClone(value ?? freshTask());
-    setTask({ ...next, queryPlan: editQueryPlan(next.queryPlan) });
-    setTools(await call("tools.list", {}));
+  function editTask(value) {
+    const { allowedTools: _legacyTools, maxToolCalls: _legacyBudget, queryPlan: _legacyPlan, queryPlanRef: _snapshot, ...next } = structuredClone(value ?? freshTask());
+    setTask({ ...next, queryPlanId: next.queryPlanId ?? "" });
   }
+  async function editPlan(value, copy = false) {
+    const available = await call("tools.list", {});
+    setTools(available);
+    setPlanDraft(value ? {
+      ...(copy ? {} : { id: value.id, revision: value.revision }),
+      name: copy ? `${value.name}（副本）` : value.name,
+      config: editQueryPlan(structuredClone(value.config)),
+    } : { name: "", config: freshQueryPlan() });
+  }
+  async function confirmPlanDeletion() {
+    if (busy || planDeleting.current || !planDeletion || planReferences(planDeletion.id).length) return;
+    planDeleting.current = true;
+    setBusy(true); setPlanDeleteError(""); setError(""); setNotice("");
+    try {
+      await call("queryPlan.delete", { id: planDeletion.id, revision: planDeletion.revision });
+      stateEpoch.current++;
+      setState((value) => ({ ...value, config: { ...value.config,
+        queryPlans: (value.config.queryPlans ?? []).filter((item) => item.id !== planDeletion.id),
+      } }));
+      setPlanDeletion(null); setNotice("查询方案已删除");
+      try { await refresh(); } catch (e) { setError(`删除已成功，但刷新列表失败：${e.message}`); }
+    } catch (e) { setPlanDeleteError(e.message); }
+    finally { planDeleting.current = false; setBusy(false); }
+  }
+  const queryPlans = state.config.queryPlans ?? [];
+  const planReferences = (id) => state.config.tasks.filter((item) => item.queryPlanId === id);
+  const selectedPlan = task ? queryPlans.find((item) => item.id === task.queryPlanId) : null;
   const setTaskField = (key, value) => setTask((t) => ({ ...t, [key]: value }));
   const toggleSource = (id) =>
     setTaskField(
@@ -567,6 +623,7 @@ export function OpsPanel({ call }) {
         {[
           ["overview", "运行概览"],
           ["sources", "告警接入"],
+          ["plans", "查询方案"],
           ["tasks", "巡检任务"],
           ["reports", "分析报告"],
           ["deliveries", "IM 投递"],
@@ -709,6 +766,37 @@ export function OpsPanel({ call }) {
           )}
         </section>
       )}
+      {tab === "plans" && (
+        <section className="ops-section">
+          <div className="ops-section-title">
+            <div><h2>查询方案</h2><p>集中维护取证步骤、MCP 用途和查询参数，巡检任务选择已有方案。</p></div>
+            <Button primary disabled={busy} onClick={() => act(() => editPlan())}>新建方案</Button>
+          </div>
+          {task && <div className="ops-plan-return ops-actions">
+            <span>巡检任务草稿已保留，维护方案后可继续配置。</span>
+            <Button onClick={() => setTab("tasks")}>返回任务草稿</Button>
+          </div>}
+          {queryPlans.map((plan) => {
+            const references = planReferences(plan.id);
+            return <article className="ops-task-card ops-plan-card" key={plan.id}>
+              <div>
+                <div className="ops-card-top"><h3>{plan.name}</h3><Badge status="ok">修订 {plan.revision}</Badge></div>
+                <p>{planNames[plan.config.id] ?? plan.config.id} · 查询超时 {plan.config.queryTimeoutSeconds} 秒 · 资产缓存 {plan.config.assetCacheSeconds} 秒 · 补查 {plan.config.maxSupplementaryCalls} 次</p>
+                <small>被 {references.length} 个任务引用{references.length ? `：${references.map((item) => item.name).join("、")}` : "，可删除"}</small>
+                <small>更新于 {time(plan.updatedAt)}；修改用于后续新批次，已排队和已有报告保留快照。</small>
+              </div>
+              <div className="ops-actions">
+                <Button disabled={busy} onClick={() => act(() => editPlan(plan))}>编辑方案</Button>
+                <Button disabled={busy} onClick={() => act(() => editPlan(plan, true))}>复制</Button>
+                <Button danger disabled={busy || references.length > 0}
+                  title={references.length ? "方案被任务引用，请先为引用任务更换方案" : "删除未被任务引用的方案"}
+                  onClick={() => { setPlanDeleteError(""); setPlanDeletion(plan); }}>删除方案</Button>
+              </div>
+            </article>;
+          })}
+          {!queryPlans.length && <Empty>先新建一个查询方案，再在巡检任务中选择它。</Empty>}
+        </section>
+      )}
       {tab === "tasks" && (
         <section className="ops-section">
           <div className="ops-section-title">
@@ -743,7 +831,7 @@ export function OpsPanel({ call }) {
                 </p>
                 <small>
                   分析预设：{t.agentPreset || "使用 DSH 默认"} ·{" "}
-                  查询方案：{planNames[t.queryPlan?.id ?? "network-ping"] ?? t.queryPlan?.id}
+                  查询方案：{queryPlans.find((plan) => plan.id === t.queryPlanId)?.name ?? "方案不可用，请重新选择"}
                 </small>
               </div>
               <div className="ops-actions">
@@ -1099,7 +1187,38 @@ export function OpsPanel({ call }) {
           </form>
         </div>
       )}
-      {task && (
+      {planDraft && (
+        <div className="ops-overlay">
+          <form className="ops-dialog ops-wide" aria-label={planDraft.id ? "编辑查询方案" : "新建查询方案"}
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const value = await act(async () => {
+                const result = await call("queryPlan.save", planDraft);
+                stateEpoch.current++;
+                return result;
+              }, "查询方案已保存，后续新批次将使用本次配置");
+              if (value) setPlanDraft(null);
+            }}>
+            <div className="ops-section-title">
+              <div><h2>{planDraft.id ? "编辑" : "新建"}查询方案</h2>
+                <p>{planDraft.id ? `当前修订 ${planDraft.revision}` : "填写名称，检查取证配置后保存。"}</p></div>
+              <Button disabled={busy} onClick={() => setPlanDraft(null)}>关闭</Button>
+            </div>
+            {error && <div role="alert" className="ops-notice ops-error">{error}</div>}
+            <Field title="方案名称"><input required maxLength={200} value={planDraft.name}
+              onChange={(e) => setPlanDraft((value) => ({ ...value, name: e.target.value }))} /></Field>
+            {planDraft.id && <div className="ops-notice">
+              被 {planReferences(planDraft.id).length} 个任务引用{planReferences(planDraft.id).length
+                ? `：${planReferences(planDraft.id).map((item) => item.name).join("、")}` : ""}。
+              <small>保存后影响这些任务的后续新批次；排队、执行中的巡检和旧报告保留各自快照。</small>
+            </div>}
+            <QueryPlanSettings value={planDraft.config} tools={tools}
+              onChange={(config) => setPlanDraft((value) => ({ ...value, config }))} />
+            <div className="ops-sticky-footer"><button className="ops-button ops-primary" disabled={busy}>保存方案</button></div>
+          </form>
+        </div>
+      )}
+      {task && tab === "tasks" && (
         <div className="ops-overlay">
           <form
             className="ops-dialog ops-wide"
@@ -1223,8 +1342,19 @@ export function OpsPanel({ call }) {
                 />
               </div>
             </div>
-            <QueryPlanSettings value={task.queryPlan} onChange={(value) => setTaskField("queryPlan", value)} tools={tools} />
-            <Field title="报告补充要求（Markdown）" hint="补充业务背景、结论格式或人工判定习惯；查询路线在上方查询方案中维护。">
+            <Field title="选择查询方案" hint="任务只保存方案引用；每次加入队列时固定当时的方案修订。">
+              <select required value={task.queryPlanId} onChange={(e) => setTaskField("queryPlanId", e.target.value)}>
+                <option value="">请选择查询方案</option>
+                {!!task.queryPlanId && !selectedPlan && <option value={task.queryPlanId}>原方案当前不可用，请重新选择</option>}
+                {queryPlans.map((plan) => <option key={plan.id} value={plan.id}>{plan.name} · 修订 {plan.revision}</option>)}
+              </select>
+            </Field>
+            {selectedPlan ? <div className="ops-notice">
+              {planNames[selectedPlan.config.id] ?? selectedPlan.config.id} · 查询超时 {selectedPlan.config.queryTimeoutSeconds} 秒 · 资产缓存 {selectedPlan.config.assetCacheSeconds} 秒 · 补查 {selectedPlan.config.maxSupplementaryCalls} 次
+              <small>工具绑定与取证步骤在“查询方案”页统一维护。</small>
+            </div> : <p className="ops-footnote">请先选择一个可用方案；没有合适的方案时，可前往管理页新建或复制。</p>}
+            <div className="ops-actions ops-plan-link"><Button onClick={() => setTab("plans")}>管理查询方案</Button><small>当前任务草稿会保留。</small></div>
+            <Field title="报告补充要求（Markdown）" hint="补充业务背景、结论格式或人工判定习惯；取证步骤在独立的查询方案页维护。">
               <textarea
                 rows="8"
                 value={task.instructions}
@@ -1232,7 +1362,7 @@ export function OpsPanel({ call }) {
               />
             </Field>
             <div className="ops-sticky-footer">
-              <button className="ops-button ops-primary" disabled={busy}>
+              <button className="ops-button ops-primary" disabled={busy || !selectedPlan}>
                 保存任务
               </button>
             </div>
@@ -1249,6 +1379,8 @@ export function OpsPanel({ call }) {
           onConfirm={confirmDeletion}
         />
       )}
+      {planDeletion && <DeleteQueryPlanDialog plan={planDeletion} references={planReferences(planDeletion.id)}
+        busy={busy} error={planDeleteError} onCancel={() => setPlanDeletion(null)} onConfirm={confirmPlanDeletion} />}
       {report && (
         <div className="ops-overlay">
           <div className="ops-dialog ops-wide">
@@ -1308,7 +1440,11 @@ export function OpsPanel({ call }) {
               )}
             </div>
             <pre className="ops-report">{report.markdown}</pre>
-            <QueryEvidence value={report.run.queryEvidence} runId={report.run.id} />
+            {report.run.task.queryPlanRef && <div className="ops-notice">
+              本次查询方案：<strong>{report.run.task.queryPlanRef.name}</strong> · 修订 {report.run.task.queryPlanRef.revision}
+              <small>这是加入队列时保存的方案快照，不随方案库后续修改而变化。</small>
+            </div>}
+            <QueryEvidence value={report.run.queryEvidence} runId={report.run.id} onDownload={download} />
             <details>
               <summary>分析会话 ID（可在 DSH 中追踪）</summary>
               <pre>{report.run.sessions.join("\n") || "暂无"}</pre>

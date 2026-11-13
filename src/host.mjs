@@ -9,7 +9,8 @@ import {
 } from "./config.mjs";
 import { localSourceInfo } from "./ingestion.mjs";
 import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
-import { QUERY_ROLES, compatibleQueryTool, normalizeQueryPlan } from "./query-plan.mjs";
+import { QUERY_ROLES, compatibleQueryTool } from "./query-plan.mjs";
+import { queryPlanEntry } from "./plan-library.mjs";
 
 export const name = "dsh-ops-assistant";
 export const inject = [
@@ -142,7 +143,7 @@ export function createHandler({
     switch (method) {
       case "state":
         return {
-          config: { ...config, tasks: config.tasks.map(({ allowedTools, maxToolCalls, ...task }) => ({ ...task, queryPlan: normalizeQueryPlan(task.queryPlan) })) },
+          config,
           runs: store.runs().map(({ alerts, report, analysisOutputs, queryEvidence, ...run }) => ({
             ...run,
             alertCount: alerts.length,
@@ -200,6 +201,27 @@ export function createHandler({
           note: result.note,
         };
       }
+      case "queryPlan.save": {
+        const existing = payload.id ? config.queryPlans.find((plan) => plan.id === payload.id) : undefined;
+        if (payload.id && !existing) throw new Error("查询方案不存在");
+        const plan = queryPlanEntry(payload, existing);
+        signal?.throwIfAborted();
+        config.queryPlans = [...config.queryPlans.filter((item) => item.id !== plan.id), plan];
+        store.saveSettings(config);
+        return plan;
+      }
+      case "queryPlan.delete": {
+        const plan = config.queryPlans.find((item) => item.id === payload.id);
+        if (!plan) throw new Error("查询方案不存在");
+        if (payload.revision !== undefined && payload.revision !== plan.revision)
+          throw new Error("查询方案已被修改，请刷新后重试");
+        if (config.tasks.some((task) => task.queryPlanId === plan.id))
+          throw new Error("查询方案仍被巡检任务引用，请先更改任务的查询方案");
+        signal?.throwIfAborted();
+        config.queryPlans = config.queryPlans.filter((item) => item.id !== plan.id);
+        store.saveSettings(config);
+        return { deleted: true, id: plan.id };
+      }
       case "task.save": {
         const existing = payload.id
           ? config.tasks.find((t) => t.id === payload.id)
@@ -209,10 +231,12 @@ export function createHandler({
         await validateTargets(getIm(), delivery);
         const latest = store.getSettings();
         const current = latest.tasks.find((t) => t.id === payload.id);
+        if (payload.id && !current) throw new Error("任务不存在");
         const task = taskConfig(
           { ...payload, ...delivery },
           latest.sources,
           current,
+          latest.queryPlans,
         );
         if (
           !existing ||

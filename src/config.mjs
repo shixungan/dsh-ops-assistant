@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { normalizeQueryPlan } from "./query-plan.mjs";
+import { DEFAULT_QUERY_PLAN_ID, defaultQueryPlans } from "./plan-library.mjs";
 const text = (v, label, max = 200) => {
   if (typeof v !== "string" || !v.trim() || v.length > max)
     throw new Error(`${label}不能为空且长度不得超过 ${max}`);
@@ -67,13 +67,17 @@ export function deliveryConfig(input) {
     sendDataOnFailure: input.sendDataOnFailure !== false,
   };
 }
-export function taskConfig(input, sources, existing) {
+export function taskConfig(input, sources, existing, plans = defaultQueryPlans()) {
   const sourceIds = [...new Set(input.sourceIds ?? [])];
   if (
     !sourceIds.length ||
     sourceIds.some((id) => !sources.some((s) => s.id === id && s.enabled))
   )
     throw new Error("至少选择一个已启用的告警源");
+  if (Object.hasOwn(input, "queryPlan")) throw new Error("请在查询方案页编辑方案，任务只选择查询方案");
+  const queryPlanId = input.queryPlanId ?? existing?.queryPlanId ?? DEFAULT_QUERY_PLAN_ID;
+  if (typeof queryPlanId !== "string" || !plans.some((plan) => plan.id === queryPlanId))
+    throw new Error("请选择一个现有查询方案");
   return {
     id: existing?.id ?? randomUUID(),
     name: text(input.name, "任务名称"),
@@ -81,7 +85,7 @@ export function taskConfig(input, sources, existing) {
     enabled: input.enabled === true,
     intervalMinutes: integer(input.intervalMinutes ?? 30, 5, 1440, "周期分钟"),
     timeoutMinutes: integer(input.timeoutMinutes ?? 15, 1, 60, "分析超时分钟"),
-    queryPlan: normalizeQueryPlan(input.queryPlan, existing?.queryPlan),
+    queryPlanId,
     maxBatchChars: integer(
       input.maxBatchChars ?? 20000,
       2000,

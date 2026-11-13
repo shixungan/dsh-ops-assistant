@@ -106,3 +106,11 @@ test("local Markdown keeps the new relation analysis and original evidence, whil
   run.report = parseAnalysis(JSON.stringify(report()), ["test:1"]);
   assert.doesNotMatch(reportMarkdown(run), /## 事件关联分析|undefined/);
 });
+
+
+test("report exports the selected plan snapshot without looking up a mutable library entry", () => {
+  const run = { ...makeRun(["test:1"]), task: { queryPlanRef: { id: "shared", name: "Business ping", revision: 3 } } };
+  assert.match(reportMarkdown(run), /查询方案：Business ping（修订 3）/);
+  delete run.task.queryPlanRef;
+  assert.doesNotMatch(reportMarkdown(run), /查询方案：|undefined/);
+});

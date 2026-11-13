@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+import { migratePlanLibrary } from "./plan-library.mjs";
 
 // One local SQLite database; continuous ingestion and report snapshots share it.
 // Raw events remain immutable per report batch. Never store credentials here.
@@ -33,12 +34,21 @@ export class Store {
     if (path !== ":memory:") chmodSync(path, 0o600);
   }
   getSettings() {
-    return JSON.parse(
+    const raw = JSON.parse(
       this.db.prepare("SELECT data FROM settings WHERE id=?").get("config")
         ?.data ?? '{"sources":[],"tasks":[]}',
     );
+    const current = migratePlanLibrary(raw);
+    if (JSON.stringify(raw) !== JSON.stringify(current)) this.writeSettings(current);
+    return current;
   }
   saveSettings(data) {
+    const current = this.getSettings();
+    // Older callers update sources/tasks without knowing about the library.
+    const merged = Object.hasOwn(data, "queryPlans") ? data : { ...data, queryPlans: current.queryPlans };
+    this.writeSettings(migratePlanLibrary(merged));
+  }
+  writeSettings(data) {
     this.db
       .prepare("INSERT OR REPLACE INTO settings VALUES (?,?)")
       .run("config", JSON.stringify(data));

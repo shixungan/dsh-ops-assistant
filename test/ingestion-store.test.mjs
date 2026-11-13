@@ -132,8 +132,12 @@ test("ingestion tables upgrade an existing database without losing settings and 
   legacy.close();
   const first = new Store(path);
   const row = event(1, 2000);
+  let migrated;
   try {
-    assert.deepEqual(first.getSettings(), settings);
+    migrated = first.getSettings();
+    const { queryPlans, ...preserved } = migrated;
+    assert.deepEqual(preserved, settings);
+    assert.equal(queryPlans.length, 2);
     first.commitIngestion("n9e", [row], state(3000));
     first.putIngestionState("n9e", {
       ...state(3000), attemptAt: 4000, status: "failed", note: "暂时不可用",
@@ -143,7 +147,7 @@ test("ingestion tables upgrade an existing database without losing settings and 
   }
   const reopened = new Store(path);
   try {
-    assert.deepEqual(reopened.getSettings(), settings);
+    assert.deepEqual(reopened.getSettings(), migrated);
     assert.deepEqual(reopened.alerts("n9e", 1000, 3000), [row]);
     assert.equal(reopened.ingestionState("n9e").coveredUntil, 3000);
     assert.equal(reopened.ingestionState("n9e").status, "failed");

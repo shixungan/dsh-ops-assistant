@@ -5,6 +5,7 @@ import {
 import { analyzeRun, deliveryText, reportMarkdown } from "./analysis.mjs";
 import { deliveryFeishuText } from "./delivery.mjs";
 import { credentialRef } from "./config.mjs";
+import { freezeTaskQueryPlan } from "./plan-library.mjs";
 
 const noAlerts = (run) => Array.isArray(run?.alerts) && run.alerts.length === 0;
 const skippedEmptyReport = () => ({ skipped: true, reason: "no-alerts" });
@@ -53,7 +54,7 @@ export class Engine {
     const run = {
       id: randomUUID(),
       taskId: task.id,
-      task: structuredClone(task),
+      task: freezeTaskQueryPlan(task, this.store.getSettings().queryPlans),
       start,
       end,
       rolling,

@@ -169,3 +169,20 @@ test("failed prefetch preserves policy messages from its partial batch result", 
   assert.equal(result.queries[0].status, "failed");
   assert.match(result.queries[0].note, /batch interrupted/);
 });
+
+
+test("library plan revisions isolate cache and exported evidence preserves selected identity", async () => {
+  const h = host();
+  const ref = { id: "shared-plan", name: "Shared network plan", revision: 1 };
+  const first = await h.create({ queryPlanRef: ref });
+  const evidence = await first.prepare();
+  assert.deepEqual(evidence.selection, ref);
+  const repeat = await h.create({ queryPlanRef: { ...ref } });
+  assert.equal((await repeat.prepare({ id: "same-revision" })).queries[0].cacheHit, true);
+  const revised = await h.create({ queryPlanRef: { ...ref, revision: 2 } });
+  assert.equal((await revised.prepare({ id: "new-revision" })).queries[0].cacheHit, false);
+  const other = await h.create({ queryPlanRef: { ...ref, id: "other-plan" } });
+  assert.equal((await other.prepare({ id: "other-library-entry" })).queries[0].cacheHit, false);
+  ref.name = "renamed outside";
+  assert.equal(evidence.selection.name, "Shared network plan");
+});

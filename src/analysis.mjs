@@ -240,6 +240,7 @@ export function reportMarkdown(run) {
     `# ${line}`,
     `批次：${run.id}`,
     `分析状态：${run.status}；告警 ${run.alerts.length} 条；覆盖 ${run.report?.coveredIds.length ?? run.analyzed ?? 0} 条`,
+    ...(run.task?.queryPlanRef ? [`查询方案：${run.task.queryPlanRef.name}（修订 ${run.task.queryPlanRef.revision}）`] : []),
     "",
     ...run.sources.map(
       (s) => `- ${s.name}：${s.status}，${s.count ?? 0} 条。${s.note ?? ""}`,

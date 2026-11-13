@@ -72,7 +72,7 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
       }
       return [name, schemas.find((s) => s.name === name)];
     });
-    record.cacheScope = stable([task.agentPreset ?? "", scopes]);
+    record.cacheScope = stable([task.agentPreset ?? "", task.queryPlanRef ?? null, scopes]);
     // Lean/old test Hosts can still analyze raw alerts without loading a new
     // runtime. A configured MCP binding must never silently bypass the SDK.
     let sdk, pipeline;
@@ -169,6 +169,7 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
       record.evidence = await active.run(record, () => collector({
         run, task: { ...task, queryPlan: plan, queryCacheScope: record.cacheScope }, schemas, signal,
       }));
+      if (task.queryPlanRef) record.evidence.selection = structuredClone(task.queryPlanRef);
       // The collector records ordinary query failures. A policy termination or
       // context delivery failure instead invalidates the entire analysis turn.
       if (record.stopError) throw record.stopError;
