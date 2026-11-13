@@ -87,8 +87,9 @@ test("document import only produces reviewable drafts and never imports IDs or v
   assert.throws(() => importDictionary("x".repeat(64001)), /64000/);
   assert.deepEqual(store.getSettings(), before);
   const discovered = await handler("dictionary.discover");
-  assert.deepEqual(discovered[0].purposes, ["assets", "events"]);
-  assert.deepEqual(discovered[1].purposes, []);
+  assert.equal(discovered[0].purposes, undefined);
+  assert.deepEqual(discovered[0].inputSchema, tool.parameters);
+  assert.equal(discovered[1].nativeCompatible, false);
   assert.equal(discovered[1].tool, "command");
 });
 

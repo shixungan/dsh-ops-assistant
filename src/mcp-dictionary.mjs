@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { DICTIONARY_PURPOSES, EXECUTABLE_PURPOSES, defaultDictionaryRecipe, normalizeDictionaryRecipe, normalizeDictionaryBindings, dictionaryToolCompatible } from "./dictionary-defs.mjs";
+import { DICTIONARY_PURPOSES, EXECUTABLE_PURPOSES, defaultDictionaryRecipe, normalizeDictionaryRecipe, dictionaryEntryIds, dictionaryToolCompatible, nativeToolCompatibility } from "./dictionary-defs.mjs";
 
 const plain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const TEXT_FIELDS = ["description", "dataObjects", "inputs", "outputs", "relationships", "timeSemantics", "limitations"];
@@ -8,24 +8,34 @@ function text(value, label, max, fallback = "") {
   if (typeof out !== "string" || out.length > max || /\x00/.test(out)) throw new Error(`${label}须为不超过 ${max} 字的文本`);
   return out.trim();
 }
-export function dictionaryDraft(input = {}, existing) {
+export function dictionaryDraft(input = {}, existing, toolDefinition) {
   if (!plain(input)) throw new Error("数据字典格式无效");
-  const purpose = input.purpose ?? existing?.purpose ?? "reference";
+  const tool = text(input.tool, "工具名", 300, existing?.tool);
+  const changedTool = Boolean(existing?.tool && tool !== existing.tool);
+  const mismatchedTemplate = Boolean(existing && !["tool", "reference"].includes(existing.purpose) && toolDefinition && !dictionaryToolCompatible(existing.purpose, toolDefinition) && nativeToolCompatibility(toolDefinition).compatible);
+  const changed = changedTool || mismatchedTemplate;
+  const purpose = changed ? (tool ? "tool" : "reference") : input.purpose ?? (existing?.purpose === "reference" && tool ? "tool" : existing?.purpose) ?? (tool ? "tool" : "reference");
   if (!DICTIONARY_PURPOSES.some((p) => p.id === purpose)) throw new Error("不支持的数据用途");
   const name = text(input.name, "字典名称", 200, existing?.name);
   if (!name) throw new Error("字典名称不能为空");
-  const tool = text(input.tool, "工具名", 300, existing?.tool);
   if (/[\x00-\x1f]/.test(tool)) throw new Error("工具名包含无效字符");
   const out = { name, purpose, tool };
   for (const key of TEXT_FIELDS) out[key] = text(input[key], key, 2000, existing?.[key]);
   out.document = text(input.document, "参考文档", 16000, existing?.document);
-  out.recipe = normalizeDictionaryRecipe(purpose, input.recipe ?? (purpose === existing?.purpose ? existing.recipe : undefined));
+  const suggested = purpose === "tool" && toolDefinition ? nativeRecipeSuggestion(toolDefinition) : undefined;
+  const recipe = changed ? (purpose === "tool" && plain(input.recipe?.arguments) ? input.recipe : suggested)
+    : input.recipe ?? (purpose === existing?.purpose ? existing.recipe : suggested);
+  out.recipe = normalizeDictionaryRecipe(purpose, recipe);
   return out;
 }
-export function dictionaryEntry(input, existing, { now = Date.now() } = {}) {
+export function dictionaryEntry(input, existing, { now = Date.now(), toolDefinition } = {}) {
   if (Object.hasOwn(input, "validation")) throw new Error("验证结果由服务端维护，请勿在保存内容中提交 validation");
   if (existing && input.revision !== existing.revision) throw new Error("数据字典已被修改，请刷新后重试");
-  const entry = { ...dictionaryDraft(input, existing), id: existing?.id ?? randomUUID(), revision: (existing?.revision ?? 0) + 1, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  const entry = { ...dictionaryDraft(input, existing, toolDefinition), id: existing?.id ?? randomUUID(), revision: (existing?.revision ?? 0) + 1, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  if (toolDefinition) {
+    entry.inputSchema = schemaSnapshot(toolDefinition.parameters ?? toolDefinition.inputSchema ?? toolDefinition.schema ?? {});
+    entry.outputSchema = schemaSnapshot(toolDefinition.outputSchema ?? toolDefinition.output?.schema ?? {});
+  }
   entry.validation = { status: "unverified", revision: entry.revision, checkedAt: null, message: "请核对数据含义后执行查询验证；保存修改会使原验证失效" };
   return entry;
 }
@@ -56,27 +66,60 @@ export function migrateMcpDictionary(settings, { now = Date.now() } = {}) {
   return result;
 }
 export function validateDictionaryReferences(plan, entries, existing) {
-  const bindings = normalizeDictionaryBindings(plan.dictionaryBindings);
-  const previous = normalizeDictionaryBindings(existing?.dictionaryBindings);
-  for (const [purpose, id] of Object.entries(bindings)) {
-    if (!id) continue;
+  const ids = dictionaryEntryIds(plan), previous = dictionaryEntryIds(existing ?? {}), templates = new Set();
+  for (const id of ids) {
     const entry = entries.find((item) => item.id === id);
-    if (!entry || entry.purpose !== purpose) throw new Error("请选择用途匹配的现有数据字典");
-    if (previous[purpose] !== id && (!["verified", "empty"].includes(entry.validation?.status) || entry.validation?.revision !== entry.revision)) throw new Error("新引用的数据字典须先通过查询验证");
+    if (!entry) throw new Error("请选择现有数据字典");
+    if (!Object.hasOwn(plan, "dictionaryIds") && !["tool", "reference"].includes(entry.purpose) && plan.dictionaryBindings?.[entry.purpose] !== id) throw new Error("请选择用途匹配的现有数据字典");
+    if (EXECUTABLE_PURPOSES.includes(entry.purpose)) {
+      if (templates.has(entry.purpose)) throw new Error("同一旧版自动取证步骤只能选择一个模板条目；原生 MCP 条目可以选择多个");
+      templates.add(entry.purpose);
+    }
+    if (entry.purpose !== "reference" && !previous.includes(id) && (!["verified", "empty"].includes(entry.validation?.status) || entry.validation?.revision !== entry.revision)) throw new Error("新引用的数据字典须先通过查询验证");
   }
 }
 export function freezeDictionary(plan, entries) {
-  const ids = Object.values(normalizeDictionaryBindings(plan.dictionaryBindings)).filter(Boolean);
+  const ids = dictionaryEntryIds(plan);
   // Missing entries remain missing in the snapshot; runtime records the gap and
   // never silently substitutes the old template for an explicit reference.
-  return structuredClone(entries.filter((entry) => ids.includes(entry.id)));
+  return structuredClone(ids.map((id) => entries.find((entry) => entry.id === id)).filter(Boolean));
+}
+function schemaSnapshot(value) {
+  const serialized = JSON.stringify(value);
+  if (!serialized || serialized.length > 64000) throw new Error("工具参数结构超过保存上限");
+  return JSON.parse(serialized);
+}
+export function nativeRecipeSuggestion(tool) {
+  const schema = tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}, args = {};
+  const aliases = { srcip: "srcip", sourceip: "srcip", dstip: "dstip", destinationip: "dstip", ip: "ip", ipaddress: "ip", host: "host", hostname: "host" };
+  const example = (s, depth = 0) => {
+    if (depth > 4) return null;
+    if (Array.isArray(s.enum) && s.enum.length) return s.enum[0];
+    if (s.type === "object") return Object.fromEntries((s.required ?? []).filter((key) => s.properties?.[key]).slice(0, 15).map((key) => [key, example(s.properties[key], depth + 1)]));
+    if (s.type === "array") return [];
+    if (s.type === "boolean") return false;
+    if (["integer", "number"].includes(s.type)) return Number.isFinite(s.minimum) ? s.minimum : 0;
+    return "";
+  };
+  for (const [key, definition] of Object.entries(schema.properties ?? {}).slice(0, 40)) {
+    const alias = aliases[key.toLowerCase().replaceAll("_", "")];
+    if (alias) args[key] = `{{alert.${alias}}}`;
+    else if ((schema.required ?? []).includes(key)) args[key] = example(definition);
+  }
+  // Unavailable/script tools can still be described; never generate executable
+  // parameter recipes for them merely because their schema contains defaults.
+  return nativeToolCompatibility(tool).compatible ? { arguments: args } : { arguments: {} };
+}
+export function describeDictionaryTool(tool) {
+  if (!tool) throw new Error("MCP 工具当前不可用，请检查完整工具名和连接");
+  const compatibility = nativeToolCompatibility(tool);
+  return { tool: tool.name, description: String(tool.description ?? "").slice(0, 4000),
+    inputSchema: schemaSnapshot(tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}), outputSchema: schemaSnapshot(tool.outputSchema ?? tool.output?.schema ?? {}),
+    recipe: nativeRecipeSuggestion(tool), nativeCompatible: compatibility.compatible, compatibilityNote: compatibility.note,
+    compatible: compatibility.compatible, reason: compatibility.note };
 }
 export function discoverDictionary(tools) {
-  return tools.slice(0, 500).map((tool) => ({
-    tool: tool.name, description: String(tool.description ?? "").slice(0, 4000),
-    parameters: tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}, outputSchema: tool.outputSchema ?? null,
-    purposes: EXECUTABLE_PURPOSES.filter((purpose) => dictionaryToolCompatible(purpose, tool)),
-  }));
+  return tools.slice(0, 500).map(describeDictionaryTool);
 }
 export function importDictionary(textInput) {
   if (typeof textInput !== "string" || !textInput.trim() || textInput.length > 64000) throw new Error("导入文档须为 1—64000 字文本");
@@ -95,14 +138,14 @@ export function importDictionary(textInput) {
     return { drafts: entries.map((entry) => dictionaryDraft(entry)) };
   }
   if (trimmed.length > 16000) throw new Error("单篇 Markdown 文档最多 16000 字");
-  const fields = { "用途": "purpose", "工具": "tool", "描述": "description", "数据对象": "dataObjects", "输入": "inputs", "输出": "outputs", "关联关系": "relationships", "时间口径": "timeSemantics", "限制": "limitations", "查询模板": "recipe" };
-  const draft = { name: /^#\s+(.+)$/m.exec(trimmed)?.[1]?.trim() ?? "导入数据说明", purpose: "reference", document: trimmed };
+  const fields = { "用途": "purpose", "工具": "tool", "描述": "description", "数据对象": "dataObjects", "输入": "inputs", "输出": "outputs", "关联关系": "relationships", "时间口径": "timeSemantics", "限制": "limitations", "查询模板": "recipe", "调用参数": "arguments" };
+  const draft = { name: /^#\s+(.+)$/m.exec(trimmed)?.[1]?.trim() ?? "导入数据说明", document: trimmed };
   const sections = [...trimmed.matchAll(/^##\s+([^\n]+)\n([\s\S]*?)(?=^##\s|$(?![\s\S]))/gm)];
   for (const section of sections) {
     const key = fields[section[1].trim()]; if (!key) continue;
     const value = section[2].trim();
-    if (key === "recipe") {
-      try { draft.recipe = JSON.parse(value.replace(/^```(?:json)?\s*\n/, "").replace(/\n```$/, "")); }
+    if (key === "recipe" || key === "arguments") {
+      try { const parsed = JSON.parse(value.replace(/^```(?:json)?\s*\n/, "").replace(/\n```$/, "")); draft.recipe = key === "arguments" ? { arguments: parsed } : parsed; }
       catch { throw new Error("查询模板须为声明式 JSON；不会执行文档内 SQL 或代码"); }
     } else draft[key] = value;
   }

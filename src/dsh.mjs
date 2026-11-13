@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createQueryRuntime } from "./query-runtime.mjs";
 import { compileDictionaryQuery, assertDictionaryArguments, dictionaryFingerprint, validateDictionaryRows } from "./dictionary-query.mjs";
 import { parseEvidenceRows } from "./query-evidence.mjs";
+import { nativeResult } from "./native-query.mjs";
 
 // rc.5 durable assistant/message stream contract. Do not collect reasoning or
 // provisional stream deltas; only the final committed assistant message is used.
@@ -176,8 +177,11 @@ export function createDshAnalyzer(ctx, options = {}) {
       const result = await record.queries.invoke(entry.tool, args, signal);
       signal.throwIfAborted();
       if (record.queries.stopError) throw record.queries.stopError;
-      let rows, fields;
-      if (["knowledge", "memory"].includes(entry.purpose)) {
+      let rows, fields, native;
+      if (entry.purpose === "tool") {
+        native = nativeResult(result); rows = native.rows; fields = native.fields;
+        if (native.partial) throw new Error("验证结果过长或包含未显示的内容，请缩小参数范围后重新验证");
+      } else if (["knowledge", "memory"].includes(entry.purpose)) {
         const text = result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
         if (!text) rows = [];
         else {
@@ -197,10 +201,10 @@ export function createDshAnalyzer(ctx, options = {}) {
         validateDictionaryRows(entry.purpose, rows);
         fields = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(0,40);
       }
-      if (rows.length > 5) throw new Error("工具返回超出5条验证样例上限，请核对数量参数与工具行为");
+      if (entry.purpose !== "tool" && rows.length > 5) throw new Error("工具返回超出5条验证样例上限，请核对数量参数与工具行为");
       return { status: rows.length ? "verified" : "empty", toolFingerprint: fingerprint, checkedAt: Date.now(), elapsedMs: Date.now()-started,
-        rowCount: rows.length, fields, sessionId: record.sessionId,
-        message: rows.length ? "有限样例查询及必需返回字段通过；字段业务含义和历史适用性仍需核对，未保存实际返回数据。" : "查询执行成功但样例为空；尚未验证返回行字段与业务含义，运行时将继续检查。" };
+        rowCount: native?.rowCount ?? rows.length, fields, sessionId: record.sessionId,
+        message: rows.length ? entry.purpose === "tool" ? "原生参数校验及可读响应通过；返回业务含义需按条目说明核对，未保存查询原文。" : "有限样例查询及必需返回字段通过；字段业务含义和历史适用性仍需核对，未保存实际返回数据。" : "查询执行成功但样例为空；尚未验证返回行字段与业务含义，运行时将继续检查。" };
     } catch (error) {
       return { status: "failed", toolFingerprint: fingerprint, checkedAt: Date.now(), elapsedMs: Date.now()-started, rowCount: 0, fields: [], sessionId: record.sessionId,
         message: String(signal.aborted ? signal.reason?.message ?? "字典验证已取消" : error.message).slice(0,400) };

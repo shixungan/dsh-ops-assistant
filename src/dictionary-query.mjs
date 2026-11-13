@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
-import { normalizeDictionaryRecipe, dictionaryToolCompatible } from "./dictionary-defs.mjs";
+import { normalizeDictionaryRecipe, dictionaryToolCompatible, dictionaryEntryIds } from "./dictionary-defs.mjs";
+import { nativeArguments, assertNativeSchema } from "./native-query.mjs";
 
 const stable = (v) => JSON.stringify(v, (_, x) => x && typeof x === "object" && !Array.isArray(x)
   ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x);
 export function dictionaryFingerprint(tool) {
   return createHash("sha256").update(stable({ name: tool.name, description: tool.description ?? "",
-    input: tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}, output: tool.outputSchema ?? tool.output?.schema ?? {} })).digest("hex");
+    input: tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}, output: tool.outputSchema ?? tool.output?.schema ?? {},
+    ...(tool.annotations ? { annotations: tool.annotations } : {}) })).digest("hex");
 }
 const ident = (value) => {
   if (typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error("字典标识符无效");
@@ -25,6 +27,7 @@ const temporal = new Set(["cmdb_observed_at", "arp_observed_at", "fdb_observed_a
 
 // A recipe is declarative: only bounded SELECT / MATCH shapes are generated.
 export function compileDictionaryQuery(entry, sample, { validation = false, tool } = {}) {
+  if (entry.purpose === "tool") return nativeArguments(entry, sample, { validation });
   const r = normalizeDictionaryRecipe(entry.purpose, entry.recipe), limit = validation ? 5 : entry.purpose === "assets" ? 257 : entry.purpose === "paths" ? 17 : 101;
   if (entry.purpose === "assets") {
     const ips = names(sample.ips, validation ? 2 : 64, isIP);
@@ -62,6 +65,7 @@ export function compileDictionaryQuery(entry, sample, { validation = false, tool
 
 export function assertDictionaryArguments(entry, tool, args) {
   if (!tool || !dictionaryToolCompatible(entry.purpose, tool)) throw new Error("字典工具不存在或参数结构不兼容");
+  if (entry.purpose === "tool") return assertNativeSchema(args, tool.parameters ?? tool.inputSchema ?? tool.schema ?? {});
   const s = tool.parameters ?? tool.inputSchema ?? tool.schema ?? {}, p = s.properties ?? {};
   if ((s.required ?? []).some((key) => !Object.hasOwn(args,key))) throw new Error("字典工具要求未配置的必填参数");
   for (const [key,value] of Object.entries(args)) {
@@ -79,24 +83,44 @@ export function validateDictionaryRows(purpose, rows) {
 }
 
 export function resolveDictionary(task, schemas) {
-  const entries = {}, evidence = []; let budget = 10000;
-  for (const [purpose,id] of Object.entries(task.queryPlan?.dictionaryBindings ?? {})) {
-    if (!id) continue;
+  const entries = {}, byId = {}, evidence = [], plan = task.queryPlan ?? {};
+  const selectedOnly = Object.hasOwn(plan, "dictionaryIds"); let budget = 10000;
+  const ids = selectedOnly ? dictionaryEntryIds(plan) : [...new Set(Object.values(plan.dictionaryBindings ?? {}).filter(Boolean))];
+  for (const id of ids) {
     const entry = task.queryDictionary?.find((x) => x.id === id);
+    const purpose = entry?.purpose ?? Object.entries(plan.dictionaryBindings ?? {}).find(([,v])=>v===id)?.[0];
     const tool = schemas.find((t) => t.name === entry?.tool);
-    let status = "ready", note = "查询结构已验证；业务语义仍以注明的口径为准，当前结果需重新查询";
-    if (!entry || entry.purpose !== purpose) { status = "unavailable"; note = "字典引用不存在或用途不匹配"; }
+    let status = "ready", note = "验证有效；当前结果仍需按本轮范围查询，业务含义以数据说明为准";
+    if (!entry) { status = "unavailable"; note = "字典引用不存在"; }
+    else if (purpose === "reference") { status = "reference"; note = "仅提供参考说明，不具有工具执行能力"; }
     else if (!["verified", "empty"].includes(entry.validation?.status) || entry.validation.revision !== entry.revision) { status = "unverified"; note = "字典尚未验证或已修改，请在字典页重新验证"; }
     else if (!tool || !dictionaryToolCompatible(purpose,tool) || dictionaryFingerprint(tool) !== entry.validation.toolFingerprint) { status = "schema_changed"; note = "字典工具不可用或工具定义已变化，请重新验证"; }
     else if (entry.validation.status === "empty") note = "验证查询执行成功但样例为空，返回字段和业务语义尚未采样；本轮仍检查实际返回结构";
-    entries[purpose] = { entry, tool: status === "ready" ? entry.tool : "", status, note };
+    const resolved = { entry, tool: status === "ready" ? entry.tool : "", status, note };
+    byId[id] = resolved;
+    if (!selectedOnly && ["tool","reference"].includes(purpose)) {
+      for (const [slot,boundId] of Object.entries(plan.dictionaryBindings ?? {})) if (boundId===id) entries[slot] = {
+        entry, tool: "", status: "skipped", skip: true,
+        note: purpose === "tool" ? "此条目已使用 MCP 原生参数，按需通过 entryId 补查；未执行旧自动取证模板" : "此条目仅提供说明，未执行旧自动取证模板",
+      };
+    }
+    if (purpose && !["tool", "reference"].includes(purpose)) {
+      if (entries[purpose]) { entries[purpose] = { entry: null, tool: "", status: "unavailable", note: "同一种旧自动取证模板存在多个引用，未选择其中任意一个" }; }
+      else entries[purpose] = resolved;
+    }
     const row = { id, name: entry?.name ?? id, revision: entry?.revision, purpose, tool: entry?.tool ?? "", status, note, checkedAt: entry?.validation?.checkedAt };
-    if (status === "ready") for (const key of ["description","dataObjects","inputs","outputs","relationships","timeSemantics","limitations","document"]) {
+    if (["ready","reference"].includes(status)) for (const key of ["description","dataObjects","inputs","outputs","relationships","timeSemantics","limitations","document"]) {
       const value = String(entry[key] ?? ""), length = Math.max(0,Math.min(1200,budget));
       row[key] = value.slice(0,length); budget -= row[key].length;
       if (value.length > length) row.documentationTruncated = true;
     }
+    if (purpose === "tool" && status === "ready") {
+      row.lookup = { entryId: id };
+      const template = JSON.stringify(entry.recipe?.arguments ?? {});
+      row.parameterTemplate = template.slice(0, Math.min(1200,Math.max(0,budget))); budget -= row.parameterTemplate.length;
+      if (row.parameterTemplate.length < template.length) row.documentationTruncated = true;
+    }
     evidence.push(row);
   }
-  return { entries, evidence };
+  return { entries, byId, evidence, selectedOnly };
 }

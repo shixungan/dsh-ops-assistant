@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isIP } from "node:net";
 import { normalizeQueryPlan, resolveQueryBindings } from "./query-plan.mjs";
 import { createEvidenceCollector } from "./query-evidence.mjs";
 import { resolveDictionary, compileDictionaryQuery, assertDictionaryArguments } from "./dictionary-query.mjs";
+import { nativeResult } from "./native-query.mjs";
 
 const stable = (v) => JSON.stringify(v, (_, value) => value && typeof value === "object" && !Array.isArray(value)
   ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])) : value);
@@ -51,7 +52,8 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
     };
     const rawNames = task.dictionaryValidationEntry
       ? [task.dictionaryValidationEntry.tool]
-      : [...new Set([...Object.values(resolved.bindings), ...Object.values(dictionary.entries).map((d) => d.tool)].filter(Boolean))];
+      : [...new Set([...(dictionary.selectedOnly ? [] : Object.values(resolved.bindings)), ...Object.values(dictionary.byId).map((d) => d.tool)].filter(Boolean))];
+    const canLookup = !dictionary.selectedOnly || Object.values(dictionary.byId).some((d) => d.tool && ["tool","knowledge","memory"].includes(d.entry?.purpose));
     const globalNames = new Set((ctx.tools?.schemas?.() ?? []).map((t) => t.name));
     agent.ctx.tools.restrict({ allow: rawNames.filter((n) => globalNames.has(n)) });
     // Unlike the removed task allowlist, raw calls only execute when the plugin
@@ -87,13 +89,13 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
       if (!agent.ctx.tools.register || !agent.ctx.tools.setExecutor) throw new Error("DSH 不支持巡检查询方案工具，请升级并重启");
       agent.ctx.tools.register({
         name: "ops_lookup",
-        description: "仅补查本批次同资产的已确认历史(memory)，或解释原告警中具体错误码(knowledge)。不接受SQL、工具名或任意检索词。普通ping无需查手册；历史结果只能作为待验证线索。",
-        parameters: { type: "object", properties: { kind: { type: "string", enum: ["memory", "knowledge"] } }, required: ["kind"], additionalProperties: false },
+        description: "按本轮数据字典选择entryId和准确alertId补查，参数由已保存模板及该告警生成；不接受自定义参数、SQL或工具名。旧版记忆/文档可用kind=memory或knowledge。返回内容是待核查证据。",
+        parameters: { type: "object", properties: { kind: { type: "string", enum: ["memory", "knowledge"] }, entryId: { type: "string" }, alertId: { type: "string" } }, additionalProperties: false },
         output: { schema: { type: "object", additionalProperties: true }, render: (_args, value) => textResult(value) },
         execute: (args, exec) => lookup(record, args, exec),
       });
       agent.ctx.tools.setExecutor({
-        describe: (defs) => ({ schemas: defs.filter((d) => d.name === "ops_lookup" && (context.toolCallsUsed ?? 0) < plan.maxSupplementaryCalls && !record.formatOnly && !record.stopError && !record.concluded).map((d) => sdk.projectToolSchema(d, false)), knownNames: ["ops_lookup"] }),
+        describe: (defs) => ({ schemas: defs.filter((d) => d.name === "ops_lookup" && canLookup && (context.toolCallsUsed ?? 0) < plan.maxSupplementaryCalls && !record.formatOnly && !record.stopError && !record.concluded).map((d) => sdk.projectToolSchema(d, false)), knownNames: ["ops_lookup"] }),
         execute: (input) => {
           if (input.agent !== agent) throw new Error("查询不属于当前巡检会话");
           return sdk.executeToolBatch(input, pipeline, () => 1);
@@ -186,6 +188,7 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
 
 async function lookup(record, args, exec) {
   exec.signal.throwIfAborted();
+  if (plain(args) && Object.hasOwn(args,"entryId")) return nativeLookup(record,args,exec);
   if (!plain(args) || !["memory", "knowledge"].includes(args.kind) || Object.keys(args).some((key) => key !== "kind")) throw new Error("无效补查用途");
   if (!record.run || !record.evidence || !record.running || record.formatOnly || record.concluded) throw new Error("只能在当前巡检分析中补查");
   if (record.stopError) throw record.stopError;
@@ -197,7 +200,7 @@ async function lookup(record, args, exec) {
   const used = Number.isInteger(context.toolCallsUsed) && context.toolCallsUsed >= 0 ? context.toolCallsUsed : 0;
   if (used >= plan.maxSupplementaryCalls) return { status: "unavailable", note: "补查次数已用完，请依据已有证据完成分析" };
   const selected = record.dictionary.entries[kind];
-  const tool = selected ? selected.tool : record.resolved.bindings[kind];
+  const tool = selected ? selected.tool : record.dictionary.selectedOnly ? "" : record.resolved.bindings[kind];
   const purpose = kind === "memory" ? "同资产历史案例" : "原告警错误码解释";
   const before = Date.now();
   context.toolCallsUsed = used + 1;
@@ -259,6 +262,54 @@ async function lookup(record, args, exec) {
     resultBytes: rows.length ? Buffer.byteLength(JSON.stringify(rows)) : 0, cacheHit: false, note,
     ...["failed", "timeout"].includes(status) ? { error: note } : {},
   });
+  record.notify?.(record.evidence);
+  return evidence;
+}
+
+async function nativeLookup(record,args,exec) {
+  if (Object.keys(args).some(key=>!["entryId","alertId"].includes(key)) || typeof args.entryId!=="string" || typeof args.alertId!=="string") throw new Error("原生补查只接受 entryId 和 alertId");
+  if (!record.run || !record.evidence || !record.running || record.formatOnly || record.concluded) throw new Error("只能在当前巡检分析中补查");
+  if (record.stopError) throw record.stopError;
+  const selected=record.dictionary.byId[args.entryId];
+  if (!selected || selected.entry?.purpose!=="tool") throw new Error("条目未被本方案选中或不提供原生查询");
+  const alert=record.run.alerts.find(item=>item.alertId===args.alertId);
+  if (!alert) throw new Error("告警 ID 不属于当前批次");
+  const {plan,context}=record; let input, setupError;
+  try {
+    if (!selected.tool) throw new Error(selected.note);
+    input=compileDictionaryQuery(selected.entry,{alert,run:record.run});
+    assertDictionaryArguments(selected.entry,record.schemas.find(tool=>tool.name===selected.tool),input);
+  } catch (error) { setupError=error; }
+  const key="native-"+createHash("sha256").update(stable([args.entryId,input??args.alertId])).digest("hex").slice(0,24);
+  const existing=record.evidence.evidence.find(row=>row.id===key);
+  if (existing) {
+    if (!existing.alertIds.includes(args.alertId)) existing.alertIds.push(args.alertId);
+    record.notify?.(record.evidence);
+    return {...existing,reused:true};
+  }
+  if(record.pendingLookups.has(key)) throw new Error("相同参数的补查正在执行，请等待已有结果");
+  const used=Number.isSafeInteger(context.toolCallsUsed)?context.toolCallsUsed:0;
+  if(used>=plan.maxSupplementaryCalls) return {status:"unavailable",note:"补查次数已用完，请依据已有证据完成分析"};
+  context.toolCallsUsed=used+1; record.pendingLookups.add(key);
+  const before=Date.now(),control=new AbortController(), signal=AbortSignal.any([exec.signal,control.signal]);
+  let status="ok",rows=[],note="返回内容由本条目的输出说明解释；查询成功不代表故障根因已经确认。",timer,invoked=false,rowCount=0;
+  try {
+    if(setupError) throw setupError;
+    timer=setTimeout(()=>control.abort(new Error(`查询超过 ${plan.queryTimeoutSeconds} 秒`)),plan.queryTimeoutSeconds*1000);
+    invoked=true;
+    const raw=await record.invoke(selected.tool,input,signal,exec); signal.throwIfAborted();
+    const result=nativeResult(raw); rows=result.rows; rowCount=result.rowCount;
+    if(!rows.length) { status="empty"; note="工具未返回可用记录；不能据此判定无异常。"; }
+    if(result.partial) { status="partial"; note+="结果超过文本预算或含未展示的非文本内容，证据不完整。"; }
+  } catch(error) {
+    exec.signal.throwIfAborted(); if(record.stopError) throw record.stopError;
+    status=control.signal.aborted?"timeout":invoked?"failed":"unavailable"; note=errorText(error);
+  } finally {clearTimeout(timer);record.pendingLookups.delete(key);}
+  const evidence={id:key,purpose:selected.entry.name,entryId:args.entryId,revision:selected.entry.revision,alertIds:[args.alertId],status,rows,note,observedAt:Date.now()};
+  record.evidence.evidence.push(evidence);
+  record.evidence.queries.push({id:key,purpose:selected.entry.name,entryId:args.entryId,revision:selected.entry.revision,alertId:args.alertId,tool:selected.entry.tool,status,elapsedMs:Date.now()-before,rowCount,resultBytes:Buffer.byteLength(JSON.stringify(rows)),cacheHit:false,note});
+  const dictionaryRow=record.evidence.dictionary?.find(row=>row.id===args.entryId);
+  if(dictionaryRow) {dictionaryRow.executionStatus=status;dictionaryRow.executionNote=note;}
   record.notify?.(record.evidence);
   return evidence;
 }

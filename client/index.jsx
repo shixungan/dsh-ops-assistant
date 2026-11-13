@@ -46,14 +46,14 @@ const planNames = Object.fromEntries(QUERY_PLANS.map((plan) => [plan.id, plan.na
 const freshQueryPlan = () => ({
   id: "network-ping", version: 1, instructions: "",
   bindings: { postgres: "", neo4j: "", knowledge: "", memory: "" },
-  dictionaryBindings: { assets: "", paths: "", events: "", knowledge: "", memory: "" },
+  dictionaryIds: [],
   assetCacheSeconds: 300, queryTimeoutSeconds: 15, maxSupplementaryCalls: 2,
 });
-const editQueryPlan = (value) => ({
-  ...freshQueryPlan(), ...value,
-  bindings: { ...freshQueryPlan().bindings, ...value?.bindings },
-  dictionaryBindings: { ...freshQueryPlan().dictionaryBindings, ...value?.dictionaryBindings },
-});
+const editQueryPlan = (value) => {
+  const plan = { ...freshQueryPlan(), ...value, bindings: { ...freshQueryPlan().bindings, ...value?.bindings } };
+  if (value && !Object.hasOwn(value, "dictionaryIds")) delete plan.dictionaryIds;
+  return plan;
+};
 const duration = (ms) => Number.isFinite(ms)
   ? (ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`) : "—";
 const freshTask = () => ({
@@ -92,7 +92,7 @@ function QueryPlanSettings({ value, onChange, tools, dictionary }) {
         </select>
       </Field>
       <div className="ops-notice">
-        {plan.id === "network-ping"
+        {Object.hasOwn(plan, "dictionaryIds") ? "AI 根据所选字典的查询说明和本批告警决定补查；仅使用条目中已配置的参数，不扩展到其他 MCP。" : plan.id === "network-ping"
           ? "批量查询源/目的 IP → 归一接入交换机 → 定位候选路径 → 查询窗口事件。普通 ping 不自动检索厂商手册。"
           : "优先整理原始告警及可识别资产；不把非网络告警套进 ping 路径分析。"}
         <small>无法确认资产、路径或数据覆盖时保留证据缺口。当前拓扑不直接证明历史窗口内的实际流量路径。</small>
@@ -100,9 +100,9 @@ function QueryPlanSettings({ value, onChange, tools, dictionary }) {
       <details><summary>查看内置排查步骤</summary>
         <pre className="ops-report">{QUERY_PLANS.find((item) => item.id === plan.id)?.instructions}</pre>
       </details>
-      <DictionaryBindings value={plan.dictionaryBindings} entries={dictionary}
-        onChange={(next) => set("dictionaryBindings", next)} />
-      <h3>内置模板的 MCP 绑定</h3><small>仅用于未选择字典条目的用途。</small>
+      <DictionaryBindings plan={plan} entries={dictionary}
+        onChange={(next) => { const { dictionaryBindings, ...rest } = plan; onChange({ ...rest, dictionaryIds: next }); }} />
+      {!Object.hasOwn(plan, "dictionaryIds") && <details><summary>旧版自动取证的 MCP 绑定</summary><small>当前方案未更改字典选择，保留旧版行为。改选字典后，仅查询所选条目。</small>
       <div className="ops-form-grid">
         {roles.map(([role, title, hint]) => {
           const candidates = tools.filter((tool) => tool.roles?.includes(role));
@@ -119,7 +119,7 @@ function QueryPlanSettings({ value, onChange, tools, dictionary }) {
           );
         })}
       </div>
-      <small>优先识别内置适配的 MCP；同优先级只有唯一匹配时才自动使用。缺失或不唯一会在报告中标明，需要时按用途指定工具。</small>
+      <small>同优先级只有唯一匹配时才自动使用；缺失或不唯一会在报告中标明。</small></details>}
       <div className="ops-form-grid">
         <Field title="单次查询超时（秒）" hint="慢查询返回明确缺口，其他已完成的证据继续参与分析。">
           <input type="number" min="1" max="60" value={plan.queryTimeoutSeconds}
@@ -129,7 +129,7 @@ function QueryPlanSettings({ value, onChange, tools, dictionary }) {
           <input type="number" min="0" max="3600" value={plan.assetCacheSeconds}
             onChange={(e) => set("assetCacheSeconds", Number(e.target.value))} />
         </Field>
-        <Field title="AI 额外补查上限" hint="固定取证完成后，最多补查的次数；0 表示只分析原文与已取证据。">
+        <Field title="AI 额外补查上限" hint="原生 MCP 和文档/记忆查询共用此预算；0 表示只分析原文与已取证据。">
           <input type="number" min="0" max="6" value={plan.maxSupplementaryCalls}
             onChange={(e) => set("maxSupplementaryCalls", Number(e.target.value))} />
         </Field>

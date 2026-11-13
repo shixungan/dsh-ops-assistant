@@ -11,7 +11,8 @@ import { localSourceInfo } from "./ingestion.mjs";
 import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
 import { QUERY_ROLES, compatibleQueryTool } from "./query-plan.mjs";
 import { queryPlanEntry } from "./plan-library.mjs";
-import { dictionaryEntry, discoverDictionary, importDictionary, validateDictionaryReferences, checkedValidation } from "./mcp-dictionary.mjs";
+import { dictionaryEntry, discoverDictionary, describeDictionaryTool, importDictionary, validateDictionaryReferences, checkedValidation } from "./mcp-dictionary.mjs";
+import { dictionaryEntryIds } from "./dictionary-defs.mjs";
 
 export const name = "dsh-ops-assistant";
 export const inject = [
@@ -46,7 +47,7 @@ export async function apply(ctx, config = {}) {
     getTools: () =>
       ctx.tools
         .schemas()
-        .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters ?? t.inputSchema, outputSchema: t.outputSchema })),
+        .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters ?? t.inputSchema, outputSchema: t.outputSchema ?? t.output?.schema, annotations: t.annotations })),
   });
   ctx.effect(
     () =>
@@ -220,15 +221,19 @@ export function createHandler({
       }
       case "dictionary.discover":
         return discoverDictionary(getTools());
+      case "dictionary.describe":
+        if (typeof payload.tool !== "string" || payload.tool.length > 300) throw new Error("请输入有效 MCP 工具标识");
+        return describeDictionaryTool(getTools().find((tool) => tool.name === payload.tool.trim()));
       case "dictionary.import":
         return importDictionary(payload.text);
       case "dictionary.save": {
         const existing = payload.id ? config.mcpDictionary.find((entry) => entry.id === payload.id) : undefined;
         if (payload.id && !existing) throw new Error("数据字典不存在");
         if (!existing && config.mcpDictionary.length >= 100) throw new Error("数据字典最多保存 100 项");
-        const entry = dictionaryEntry(payload, existing);
-        if (existing && existing.purpose !== entry.purpose && config.queryPlans.some((plan) => Object.values(plan.config.dictionaryBindings ?? {}).includes(entry.id)))
-          throw new Error("已引用字典不能改变用途，请复制新条目后重新绑定");
+        const toolName = typeof payload.tool === "string" ? payload.tool.trim() : existing?.tool;
+        const entry = dictionaryEntry(payload, existing, { toolDefinition: getTools().find((tool) => tool.name === toolName) });
+        if (existing && existing.purpose !== entry.purpose && payload.purpose && payload.purpose !== existing.purpose && config.queryPlans.some((plan) => dictionaryEntryIds(plan.config).includes(entry.id)))
+          throw new Error("已引用的旧模板不能改变用途，请复制新条目后重新选择");
         signal?.throwIfAborted();
         config.mcpDictionary = [...config.mcpDictionary.filter((item) => item.id !== entry.id), entry];
         store.saveSettings(config);
@@ -238,7 +243,7 @@ export function createHandler({
         const entry = config.mcpDictionary.find((item) => item.id === payload.id);
         if (!entry) throw new Error("数据字典不存在");
         if (payload.revision !== entry.revision) throw new Error("数据字典已被修改，请刷新后重试");
-        if (config.queryPlans.some((plan) => Object.values(plan.config.dictionaryBindings ?? {}).includes(entry.id)))
+        if (config.queryPlans.some((plan) => dictionaryEntryIds(plan.config).includes(entry.id)))
           throw new Error("数据字典仍被查询方案引用，请先更改方案引用");
         signal?.throwIfAborted();
         config.mcpDictionary = config.mcpDictionary.filter((item) => item.id !== entry.id);
@@ -250,7 +255,7 @@ export function createHandler({
         const entry = config.mcpDictionary.find((item) => item.id === payload.id);
         if (!entry) throw new Error("数据字典不存在");
         if (payload.revision !== entry.revision) throw new Error("数据字典已被修改，请刷新后重试");
-        if (!entry.tool || entry.purpose === "reference") throw new Error("请选择可执行用途和实际 MCP 工具后验证");
+        if (!entry.tool || entry.purpose === "reference") throw new Error("请填写实际 MCP 工具并读取参数后验证");
         if (validating.has(entry.id)) throw new Error("此字典正在验证，请等待完成");
         if (typeof payload.workspace !== "string" || !/^(?:\/|[A-Za-z]:[\\/])/.test(payload.workspace) || payload.workspace.length > 2000 || /[\x00-\x1f]/.test(payload.workspace)) throw new Error("验证工作目录须为服务器上的绝对路径");
         if (payload.agentPreset !== undefined && (typeof payload.agentPreset !== "string" || payload.agentPreset.length > 300 || /[\x00-\x1f]/.test(payload.agentPreset))) throw new Error("分析预设无效");
@@ -387,6 +392,7 @@ export function createHandler({
     "run.alerts",
     "tools.list",
     "dictionary.discover",
+    "dictionary.describe",
     "dictionary.import",
     "im.bots",
     "im.targets",

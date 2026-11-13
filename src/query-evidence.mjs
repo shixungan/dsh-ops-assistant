@@ -131,19 +131,26 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
   return async function collect({ run, task, schemas = [], signal, onProgress }) {
     const started = now(), plan = normalizeQueryPlan(task.queryPlan), resolved = resolveQueryBindings(plan, schemas);
     const dictionary = resolveDictionary(task, schemas);
-    const result = { plan: { ...plan, name: QUERY_PLANS.find((p) => p.id === plan.id).name }, bindings: resolved.bindings, evidence: [], queries: [], elapsedMs: 0,
+    const result = { plan: { ...plan, name: QUERY_PLANS.find((p) => p.id === plan.id).name }, bindings: dictionary.selectedOnly ? {} : resolved.bindings, evidence: [], queries: [], elapsedMs: 0,
       ...(dictionary.evidence.length ? { dictionary: dictionary.evidence } : {}) };
     if (!run.alerts?.length) return result;
+    // Explicit selection means only these entries. Native tools are available
+    // for bounded AI lookups; do not prefetch unrelated legacy databases.
+    if (dictionary.selectedOnly && !Object.keys(dictionary.entries).some((id) => ["assets","paths","events"].includes(id))) {
+      result.elapsedMs = now() - started;
+      return result;
+    }
     const add = (id, purpose, status, rows, note, extra = {}) => {
       const evidence = { id, purpose, status, rows, note, ...extra }; result.evidence.push(evidence); return evidence;
     };
     const query = async (id, purpose, role, args, limit, cacheable = false, sample = {}) => {
       signal?.throwIfAborted();
       const selected = dictionary.entries[id];
-      const tool = selected ? selected.tool : resolved.bindings[role], before = now();
+      if (selected?.skip || dictionary.selectedOnly && !selected) return add(id, purpose, "skipped", [], selected?.note ?? "本方案未选择此自动取证条目");
+      const tool = selected ? selected.tool : dictionary.selectedOnly ? "" : resolved.bindings[role], before = now();
       onProgress?.({ stage: purpose });
       if (!tool) {
-        const note = selected?.note ?? resolved.issues.find((v) => v.role === role)?.note ?? "未配置对应查询工具";
+        const note = selected?.note ?? (dictionary.selectedOnly ? "本方案未选择此自动取证条目" : resolved.issues.find((v) => v.role === role)?.note ?? "未配置对应查询工具");
         result.queries.push({ id, purpose, tool: "", status: "unavailable", elapsedMs: 0, rowCount: 0, resultBytes: 0, cacheHit: false, note });
         return add(id, purpose, "unavailable", [], note);
       }
@@ -240,7 +247,7 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
       if (pairs.length > MAX_PAIRS) add("pair-limit", "路径范围", "partial", [], `路径端点对超过 ${MAX_PAIRS} 组，超出部分未查询`);
       if (pairs.length) {
         const paths = await query("paths", "查询候选多跳路径", "neo4j", pathQuery(pairs.slice(0, MAX_PAIRS)), MAX_PAIRS, false, { pairs: pairs.slice(0, MAX_PAIRS) });
-        paths.note = [paths.note, "仅为当前拓扑候选路径（最多 8 跳），不等于真实流量路径；未查到不能证明没有链路，历史状态需另行验证"].filter(Boolean).join("；");
+        if (paths.status !== "skipped") paths.note = [paths.note, "仅为当前拓扑候选路径（最多 8 跳），不等于真实流量路径；未查到不能证明没有链路，历史状态需另行验证"].filter(Boolean).join("；");
         for (const path of paths.rows) for (const node of Array.isArray(path.switches) ? path.switches : []) if (typeof node.hostname === "string" && node.hostname.length <= 200) hosts.add(node.hostname);
       }
       if (hosts.size) {
