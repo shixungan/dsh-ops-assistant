@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 import { createHash } from "node:crypto";
 import { QUERY_PLANS, normalizeQueryPlan, resolveQueryBindings } from "./query-plan.mjs";
+import { resolveDictionary, compileDictionaryQuery, assertDictionaryArguments, validateDictionaryRows } from "./dictionary-query.mjs";
 
 const MAX_IPS = 64, MAX_ASSETS = 256, MAX_PAIRS = 16, MAX_EVENTS = 100;
 const sqlString = (value) => "'" + String(value).replaceAll("'", "''").replaceAll("\\", "\\\\") + "'";
@@ -98,7 +99,7 @@ export function parseEvidenceRows(input) {
 const ASSET_FIELDS = ["ip_address", "asset_name", "asset_resource_id", "asset_type", "asset_idc", "ip_vrf", "ip_mapping_ambiguous", "terminal_location_ambiguous", "switch_hostname", "switch_mgmt_ip", "switch_idc", "switch_role", "physical_if_name", "logical_if_name", "cmdb_observed_at", "arp_observed_at", "fdb_observed_at"];
 export function assetQuery(ips) {
   if (!ips.length || ips.some((ip) => !isIP(ip)) || ips.length > MAX_IPS) throw new Error("无效资产 IP 范围");
-  return { sql: `SELECT ip_address::text AS ip_address, asset_name, asset_resource_id, asset_type, asset_idc, ip_vrf, ip_mapping_ambiguous, terminal_location_ambiguous, switch_hostname, switch_mgmt_ip::text AS switch_mgmt_ip, switch_idc, switch_role, physical_if_name, logical_if_name, cmdb_observed_at::text AS cmdb_observed_at, arp_observed_at::text AS arp_observed_at, fdb_observed_at::text AS fdb_observed_at FROM public.cmdb_online_ip_switch_port_current WHERE ip_address IN (${ips.map((ip) => `E${sqlString(ip)}::inet`).join(",")}) ORDER BY ip_address, switch_hostname, asset_resource_id LIMIT ${MAX_ASSETS + 1}` };
+  return { sql: `SELECT host(ip_address::inet) AS ip_address, asset_name, asset_resource_id, asset_type, asset_idc, ip_vrf, ip_mapping_ambiguous, terminal_location_ambiguous, switch_hostname, switch_mgmt_ip::text AS switch_mgmt_ip, switch_idc, switch_role, physical_if_name, logical_if_name, cmdb_observed_at::text AS cmdb_observed_at, arp_observed_at::text AS arp_observed_at, fdb_observed_at::text AS fdb_observed_at FROM public.cmdb_online_ip_switch_port_current WHERE ip_address IN (${ips.map((ip) => `E${sqlString(ip)}::inet`).join(",")}) ORDER BY ip_address, switch_hostname, asset_resource_id LIMIT ${MAX_ASSETS + 1}` };
 }
 export function pathQuery(pairs) {
   return {
@@ -129,22 +130,38 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
   const cache = new Map();
   return async function collect({ run, task, schemas = [], signal, onProgress }) {
     const started = now(), plan = normalizeQueryPlan(task.queryPlan), resolved = resolveQueryBindings(plan, schemas);
-    const result = { plan: { ...plan, name: QUERY_PLANS.find((p) => p.id === plan.id).name }, bindings: resolved.bindings, evidence: [], queries: [], elapsedMs: 0 };
+    const dictionary = resolveDictionary(task, schemas);
+    const result = { plan: { ...plan, name: QUERY_PLANS.find((p) => p.id === plan.id).name }, bindings: resolved.bindings, evidence: [], queries: [], elapsedMs: 0,
+      ...(dictionary.evidence.length ? { dictionary: dictionary.evidence } : {}) };
     if (!run.alerts?.length) return result;
     const add = (id, purpose, status, rows, note, extra = {}) => {
       const evidence = { id, purpose, status, rows, note, ...extra }; result.evidence.push(evidence); return evidence;
     };
-    const query = async (id, purpose, role, args, limit, cacheable = false) => {
+    const query = async (id, purpose, role, args, limit, cacheable = false, sample = {}) => {
       signal?.throwIfAborted();
-      const tool = resolved.bindings[role], before = now();
+      const selected = dictionary.entries[id];
+      const tool = selected ? selected.tool : resolved.bindings[role], before = now();
       onProgress?.({ stage: purpose });
       if (!tool) {
-        const note = resolved.issues.find((v) => v.role === role)?.note ?? "未配置对应查询工具";
+        const note = selected?.note ?? resolved.issues.find((v) => v.role === role)?.note ?? "未配置对应查询工具";
         result.queries.push({ id, purpose, tool: "", status: "unavailable", elapsedMs: 0, rowCount: 0, resultBytes: 0, cacheHit: false, note });
         return add(id, purpose, "unavailable", [], note);
       }
       // Do not share cached evidence across tasks, workspaces, binding/plan edits.
-      const key = hash([task.id ?? run.id, task.workspace, task.queryCacheScope ?? null, plan, tool, args]);
+      if (selected) {
+        try {
+          args = compileDictionaryQuery(selected.entry, sample);
+          assertDictionaryArguments(selected.entry, schemas.find((t) => t.name === tool), args);
+        } catch (error) {
+          const note = `字典模板不可执行：${boundedText(error.message, 400)}`;
+          const dictionaryRow = result.dictionary.find((item) => item.purpose === id);
+          dictionaryRow.status = "failed";
+          dictionaryRow.note = note;
+          result.queries.push({ id, purpose, tool, status: "failed", elapsedMs: now()-before, rowCount: 0, resultBytes: 0, cacheHit: false, note });
+          return add(id, purpose, "failed", [], note);
+        }
+      }
+      const key = hash([task.id ?? run.id, task.workspace, task.queryCacheScope ?? null, plan, selected?.entry ?? null, tool, args]);
       const hit = cacheable && plan.assetCacheSeconds > 0 && cache.get(key);
       if (hit && hit.expires > now()) {
         const evidence = add(id, purpose, "ok", clone(hit.rows), "复用资产映射缓存；仅用于定位，不代表窗口当时在线", { observedAt: hit.observedAt, cacheHit: true });
@@ -160,6 +177,7 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
         const raw = await invoke(tool, args, combined);
         combined.throwIfAborted();
         let rows = parseEvidenceRows(raw);
+        if (selected) validateDictionaryRows(id, rows);
         if (rows.some((row) => id === "assets" ? !isIP(row.ip_address ?? "") || !Object.hasOwn(row, "switch_hostname")
           : id === "paths" ? typeof row.src !== "string" || typeof row.dst !== "string" || !Array.isArray(row.switches) || !Array.isArray(row.links)
           : id === "events" ? typeof row.kind !== "string" || typeof row.event_time !== "string" : false))
@@ -188,6 +206,11 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
         signal?.throwIfAborted();
         const note = boundedText(error.message ?? String(error), 400);
         const status = control.signal.aborted ? "timeout" : "failed";
+        if (selected) {
+          const dictionaryRow = result.dictionary.find((item) => item.purpose === id);
+          dictionaryRow.status = status;
+          dictionaryRow.note = `本轮字典查询失败，请核对模板与数据结构后重新验证：${note}`;
+        }
         result.queries.push({ id, purpose, tool, status, elapsedMs: now() - before, rowCount: 0, resultBytes: 0, cacheHit: false, note, error: note });
         return add(id, purpose, status, [], note);
       } finally { clearTimeout(timer); }
@@ -199,7 +222,7 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
     if (ips.length > MAX_IPS) add("ip-limit", "资产范围", "partial", [], `唯一 IP 超过 ${MAX_IPS} 个，超出部分未补查`);
     if (!ips.length) add("assets", "批量资产归一", "unavailable", [], "告警未提供可验证的 IP，未猜测资产；请依据原文分析并记录证据缺口");
     else {
-      const assets = await query("assets", "批量资产归一", "postgres", assetQuery(ips.slice(0, MAX_IPS)), MAX_ASSETS, true);
+      const assets = await query("assets", "批量资产归一", "postgres", assetQuery(ips.slice(0, MAX_IPS)), MAX_ASSETS, true, { ips: ips.slice(0, MAX_IPS) });
       assets.note = [assets.note, "资产映射为当前采集快照，不代表历史告警窗口状态；保留全部候选和歧义字段"].filter(Boolean).join("；");
       const hosts = new Set(assets.rows.map((r) => r.switch_hostname).filter((h) => typeof h === "string" && h.length <= 200));
       const mapped = (ip) => {
@@ -216,14 +239,14 @@ export function createEvidenceCollector({ invoke, now = Date.now }) {
       }
       if (pairs.length > MAX_PAIRS) add("pair-limit", "路径范围", "partial", [], `路径端点对超过 ${MAX_PAIRS} 组，超出部分未查询`);
       if (pairs.length) {
-        const paths = await query("paths", "查询候选多跳路径", "neo4j", pathQuery(pairs.slice(0, MAX_PAIRS)), MAX_PAIRS);
+        const paths = await query("paths", "查询候选多跳路径", "neo4j", pathQuery(pairs.slice(0, MAX_PAIRS)), MAX_PAIRS, false, { pairs: pairs.slice(0, MAX_PAIRS) });
         paths.note = [paths.note, "仅为当前拓扑候选路径（最多 8 跳），不等于真实流量路径；未查到不能证明没有链路，历史状态需另行验证"].filter(Boolean).join("；");
         for (const path of paths.rows) for (const node of Array.isArray(path.switches) ? path.switches : []) if (typeof node.hostname === "string" && node.hostname.length <= 200) hosts.add(node.hostname);
       }
       if (hosts.size) {
         if (hosts.size > 128) add("host-limit", "设备范围", "partial", [], "路径设备超过 128 个，超出部分未查询窗口事件");
-        const logs = await query("events", "查询窗口设备事件", "postgres", eventQuery([...hosts].sort().slice(0, 128), run.start, run.end), MAX_EVENTS);
-        logs.note = [logs.note, "syslog 按 host_info 精确匹配设备名；其 inserted_at 是入库时间。未覆盖接口性能指标，空记录不代表无异常"].filter(Boolean).join("；");
+        const logs = await query("events", "查询窗口设备事件", "postgres", eventQuery([...hosts].sort().slice(0, 128), run.start, run.end), MAX_EVENTS, false, { hosts: [...hosts].sort().slice(0,128), start: run.start, end: run.end });
+        logs.note = [logs.note, dictionary.entries.events ? `时间口径：${dictionary.entries.events.entry?.timeSemantics ?? "未说明"}。空记录不代表无异常` : "syslog 按 host_info 精确匹配设备名；其 inserted_at 是入库时间。未覆盖接口性能指标，空记录不代表无异常"].filter(Boolean).join("；");
       } else add("events", "查询窗口设备事件", "unavailable", [], "未归一出接入设备，无法限定查询范围；未扩大到全库扫描");
     }
     result.elapsedMs = now() - started;

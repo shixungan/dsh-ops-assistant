@@ -1,5 +1,6 @@
 // Shared by the browser and server. A document explains a plan; only these
 // versioned templates and role bindings grant its actual query capabilities.
+import { normalizeDictionaryBindings } from "./dictionary-defs.mjs";
 export const QUERY_PLANS = [
   {
     id: "network-ping", version: 1, name: "Ping 丢包与跨机房路径",
@@ -39,6 +40,7 @@ export function normalizeQueryPlan(input, existing) {
   if (typeof instructions !== "string" || instructions.length > 12000) throw new Error("查询方案说明须为不超过 12000 字的文本");
   return {
     id, version: definition.version, instructions, bindings,
+    dictionaryBindings: normalizeDictionaryBindings(data.dictionaryBindings ?? existing?.dictionaryBindings),
     assetCacheSeconds: integer(data.assetCacheSeconds, 300, 0, 3600, "资产缓存秒数"),
     queryTimeoutSeconds: integer(data.queryTimeoutSeconds, 15, 1, 60, "单次查询超时秒数"),
     maxSupplementaryCalls: integer(data.maxSupplementaryCalls, 2, 0, 6, "补充查询次数"),

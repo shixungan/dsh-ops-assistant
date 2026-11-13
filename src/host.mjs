@@ -11,6 +11,7 @@ import { localSourceInfo } from "./ingestion.mjs";
 import { imStatus, listBots, listTargets, validateTargets } from "./im.mjs";
 import { QUERY_ROLES, compatibleQueryTool } from "./query-plan.mjs";
 import { queryPlanEntry } from "./plan-library.mjs";
+import { dictionaryEntry, discoverDictionary, importDictionary, validateDictionaryReferences, checkedValidation } from "./mcp-dictionary.mjs";
 
 export const name = "dsh-ops-assistant";
 export const inject = [
@@ -26,10 +27,11 @@ export async function apply(ctx, config = {}) {
   const store = storage.store;
   const getIm = () =>
     typeof ctx.get === "function" ? ctx.get("dshIm") : undefined;
+  const analyze = createDshAnalyzer(ctx);
   const engine = new Engine({
     store,
     credentials: ctx.credentials,
-    analyze: createDshAnalyzer(ctx),
+    analyze,
     getIm,
   });
   engine.initialize();
@@ -40,10 +42,11 @@ export async function apply(ctx, config = {}) {
     credentials: ctx.credentials,
     getIm,
     storage,
+    validateDictionary: (entry, options, signal) => analyze.validateDictionary(entry, options, signal),
     getTools: () =>
       ctx.tools
         .schemas()
-        .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+        .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters ?? t.inputSchema, outputSchema: t.outputSchema })),
   });
   ctx.effect(
     () =>
@@ -121,6 +124,7 @@ export async function apply(ctx, config = {}) {
       clearInterval(timer);
       await storage.movePromise?.catch(() => {});
       await engine.close();
+      await Promise.allSettled([...(engine.dictionaryValidationPromises ?? [])]);
       await engine.tickPromise?.catch(() => {});
       await engine.pollPromise?.catch(() => {});
       store.close();
@@ -134,8 +138,10 @@ export function createHandler({
   credentials,
   getIm,
   getTools = () => [],
+  validateDictionary,
   storage,
 }) {
+  const validating = new Set();
   const handle = async (method, payload = {}, signal) => {
     if (!payload || typeof payload !== "object" || Array.isArray(payload))
       throw new Error("无效请求");
@@ -146,6 +152,7 @@ export function createHandler({
           config,
           runs: store.runs().map(({ alerts, report, analysisOutputs, queryEvidence, ...run }) => ({
             ...run,
+            task: run.task ? Object.fromEntries(Object.entries(run.task).filter(([key]) => key !== "queryDictionary")) : run.task,
             alertCount: alerts.length,
             summary: report?.summary,
             coveredCount: report?.coveredIds.length ?? 0,
@@ -205,10 +212,75 @@ export function createHandler({
         const existing = payload.id ? config.queryPlans.find((plan) => plan.id === payload.id) : undefined;
         if (payload.id && !existing) throw new Error("查询方案不存在");
         const plan = queryPlanEntry(payload, existing);
+        validateDictionaryReferences(plan.config, config.mcpDictionary, existing?.config);
         signal?.throwIfAborted();
         config.queryPlans = [...config.queryPlans.filter((item) => item.id !== plan.id), plan];
         store.saveSettings(config);
         return plan;
+      }
+      case "dictionary.discover":
+        return discoverDictionary(getTools());
+      case "dictionary.import":
+        return importDictionary(payload.text);
+      case "dictionary.save": {
+        const existing = payload.id ? config.mcpDictionary.find((entry) => entry.id === payload.id) : undefined;
+        if (payload.id && !existing) throw new Error("数据字典不存在");
+        if (!existing && config.mcpDictionary.length >= 100) throw new Error("数据字典最多保存 100 项");
+        const entry = dictionaryEntry(payload, existing);
+        if (existing && existing.purpose !== entry.purpose && config.queryPlans.some((plan) => Object.values(plan.config.dictionaryBindings ?? {}).includes(entry.id)))
+          throw new Error("已引用字典不能改变用途，请复制新条目后重新绑定");
+        signal?.throwIfAborted();
+        config.mcpDictionary = [...config.mcpDictionary.filter((item) => item.id !== entry.id), entry];
+        store.saveSettings(config);
+        return entry;
+      }
+      case "dictionary.delete": {
+        const entry = config.mcpDictionary.find((item) => item.id === payload.id);
+        if (!entry) throw new Error("数据字典不存在");
+        if (payload.revision !== entry.revision) throw new Error("数据字典已被修改，请刷新后重试");
+        if (config.queryPlans.some((plan) => Object.values(plan.config.dictionaryBindings ?? {}).includes(entry.id)))
+          throw new Error("数据字典仍被查询方案引用，请先更改方案引用");
+        signal?.throwIfAborted();
+        config.mcpDictionary = config.mcpDictionary.filter((item) => item.id !== entry.id);
+        store.saveSettings(config);
+        return { deleted: true, id: entry.id };
+      }
+      case "dictionary.validate": {
+        if (!validateDictionary) throw new Error("当前实例不支持 MCP 查询验证");
+        const entry = config.mcpDictionary.find((item) => item.id === payload.id);
+        if (!entry) throw new Error("数据字典不存在");
+        if (payload.revision !== entry.revision) throw new Error("数据字典已被修改，请刷新后重试");
+        if (!entry.tool || entry.purpose === "reference") throw new Error("请选择可执行用途和实际 MCP 工具后验证");
+        if (validating.has(entry.id)) throw new Error("此字典正在验证，请等待完成");
+        if (typeof payload.workspace !== "string" || !/^(?:\/|[A-Za-z]:[\\/])/.test(payload.workspace) || payload.workspace.length > 2000 || /[\x00-\x1f]/.test(payload.workspace)) throw new Error("验证工作目录须为服务器上的绝对路径");
+        if (payload.agentPreset !== undefined && (typeof payload.agentPreset !== "string" || payload.agentPreset.length > 300 || /[\x00-\x1f]/.test(payload.agentPreset))) throw new Error("分析预设无效");
+        if (!payload.sample || typeof payload.sample !== "object" || Array.isArray(payload.sample) || JSON.stringify(payload.sample).length > 16000) throw new Error("验证样例格式无效或过大");
+        const signals = [signal, engine.lifecycle?.signal].filter(Boolean);
+        const combined = signals.length ? AbortSignal.any(signals) : new AbortController().signal;
+        combined.throwIfAborted();
+        validating.add(entry.id);
+        engine.dictionaryValidationPromises ??= new Set();
+        const pending = Promise.resolve().then(() => validateDictionary(structuredClone(entry), { workspace: payload.workspace, agentPreset: payload.agentPreset ?? "", sample: structuredClone(payload.sample) }, combined));
+        engine.dictionaryValidationPromises.add(pending);
+        try {
+          let result;
+          try { result = await pending; }
+          catch (error) {
+            combined.throwIfAborted();
+            result = { status: "failed", message: String(error.message ?? error).slice(0, 400) };
+          }
+          combined.throwIfAborted();
+          const latest = store.getSettings();
+          const current = latest.mcpDictionary.find((item) => item.id === entry.id);
+          if (!current || current.revision !== entry.revision) throw new Error("验证期间数据字典已变更，结果未覆盖最新配置，请重新验证");
+          current.validation = checkedValidation(result, current);
+          latest.mcpDictionary = latest.mcpDictionary.map((item) => item.id === current.id ? current : item);
+          store.saveSettings(latest);
+          return current;
+        } finally {
+          validating.delete(entry.id);
+          engine.dictionaryValidationPromises.delete(pending);
+        }
       }
       case "queryPlan.delete": {
         const plan = config.queryPlans.find((item) => item.id === payload.id);
@@ -314,6 +386,8 @@ export function createHandler({
     "run.get",
     "run.alerts",
     "tools.list",
+    "dictionary.discover",
+    "dictionary.import",
     "im.bots",
     "im.targets",
   ]);

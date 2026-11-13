@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { isIP } from "node:net";
 import { normalizeQueryPlan, resolveQueryBindings } from "./query-plan.mjs";
 import { createEvidenceCollector } from "./query-evidence.mjs";
+import { resolveDictionary, compileDictionaryQuery, assertDictionaryArguments } from "./dictionary-query.mjs";
 
 const stable = (v) => JSON.stringify(v, (_, value) => value && typeof value === "object" && !Array.isArray(value)
   ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])) : value);
@@ -42,12 +43,15 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
     const plan = normalizeQueryPlan(task.queryPlan);
     const schemas = ctx.tools?.schemas?.(agent) ?? [];
     const resolved = resolveQueryBindings(plan, schemas);
+    const dictionary = resolveDictionary(task, schemas);
     const permits = new Map();
     const record = {
-      plan, schemas, resolved, context, permits, running: false, formatOnly: task.formatOnly === true,
+      plan, schemas, resolved, dictionary, context, permits, running: false, formatOnly: task.formatOnly === true,
       evidence: null, run: null, notify: null, stopError: null, concluded: false, pendingLookups: new Set(),
     };
-    const rawNames = [...new Set(Object.values(resolved.bindings).filter(Boolean))];
+    const rawNames = task.dictionaryValidationEntry
+      ? [task.dictionaryValidationEntry.tool]
+      : [...new Set([...Object.values(resolved.bindings), ...Object.values(dictionary.entries).map((d) => d.tool)].filter(Boolean))];
     const globalNames = new Set((ctx.tools?.schemas?.() ?? []).map((t) => t.name));
     agent.ctx.tools.restrict({ allow: rawNames.filter((n) => globalNames.has(n)) });
     // Unlike the removed task allowlist, raw calls only execute when the plugin
@@ -72,7 +76,7 @@ export function createQueryRuntime(ctx, { loadSdk = defaultSdk } = {}) {
       }
       return [name, schemas.find((s) => s.name === name)];
     });
-    record.cacheScope = stable([task.agentPreset ?? "", task.queryPlanRef ?? null, scopes]);
+    record.cacheScope = stable([task.agentPreset ?? "", task.queryPlanRef ?? null, task.queryDictionary ?? null, scopes]);
     // Lean/old test Hosts can still analyze raw alerts without loading a new
     // runtime. A configured MCP binding must never silently bypass the SDK.
     let sdk, pipeline;
@@ -192,7 +196,8 @@ async function lookup(record, args, exec) {
   if (record.pendingLookups.has(kind)) throw new Error("同一用途的补查正在执行，请等待已有结果");
   const used = Number.isInteger(context.toolCallsUsed) && context.toolCallsUsed >= 0 ? context.toolCallsUsed : 0;
   if (used >= plan.maxSupplementaryCalls) return { status: "unavailable", note: "补查次数已用完，请依据已有证据完成分析" };
-  const tool = record.resolved.bindings[kind];
+  const selected = record.dictionary.entries[kind];
+  const tool = selected ? selected.tool : record.resolved.bindings[kind];
   const purpose = kind === "memory" ? "同资产历史案例" : "原告警错误码解释";
   const before = Date.now();
   context.toolCallsUsed = used + 1;
@@ -200,7 +205,7 @@ async function lookup(record, args, exec) {
   const control = new AbortController();
   let status = "ok", rows = [], note = "", timer, invoked = false;
   try {
-    if (!tool) throw new Error("未发现唯一兼容工具，请在查询方案中指定该用途");
+    if (!tool) throw new Error(selected?.note ?? "未发现唯一兼容工具，请在查询方案中指定该用途");
     const alerts = record.run.alerts ?? [];
     const codes = [...new Set(alerts.flatMap((a) => `${a.title ?? ""} ${a.raw?.description ?? ""} ${a.raw?.rule_note ?? ""}`.match(/\b(?:[A-Z][A-Z0-9_]{1,24}[-_/]\d{2,10}|ERR_[A-Z0-9_]{2,40}|0x[0-9A-Fa-f]{4,12})\b/g) ?? []))].slice(0,5);
     const entities = [...new Set(alerts.map((a) => a.host).filter((host) => typeof host === "string")
@@ -216,9 +221,12 @@ async function lookup(record, args, exec) {
     const props = schema.properties ?? {};
     const key = ["query", "keyword", "query_text"].find((k) => props[k]?.type === "string");
     if (!key) throw new Error("补查工具检索参数不兼容");
-    const input = { [key]: query.slice(0,1000) };
-    for (const k of ["limit", "top_k", "topK", "max_results"]) if (["integer", "number"].includes(props[k]?.type)) input[k] = 3;
-    if ((schema.required ?? []).some((k) => !Object.hasOwn(input,k))) throw new Error("补查工具还要求未配置的参数，未猜测账号或知识库范围");
+    const input = selected ? compileDictionaryQuery(selected.entry, { query: query.slice(0,1000) }, { tool: definition }) : { [key]: query.slice(0,1000) };
+    if (selected) assertDictionaryArguments(selected.entry, definition, input);
+    else {
+      for (const k of ["limit", "top_k", "topK", "max_results"]) if (["integer", "number"].includes(props[k]?.type)) input[k] = 3;
+      if ((schema.required ?? []).some((k) => !Object.hasOwn(input,k))) throw new Error("补查工具还要求未配置的参数，未猜测账号或知识库范围");
+    }
     const signal = AbortSignal.any([exec.signal, control.signal]);
     timer = setTimeout(() => control.abort(new Error(`查询超过 ${plan.queryTimeoutSeconds} 秒`)), plan.queryTimeoutSeconds * 1000);
     invoked = true;
@@ -242,6 +250,10 @@ async function lookup(record, args, exec) {
     record.pendingLookups.delete(kind);
   }
   const evidence = { id, purpose, status, rows, note, observedAt: Date.now() };
+  if (selected?.status === "ready" && status !== "ok") {
+    const dictionaryRow = record.evidence.dictionary?.find((item) => item.purpose === kind);
+    if (dictionaryRow) { dictionaryRow.status = status; dictionaryRow.note = `本轮字典补查${invoked ? "结果" : "未执行"}：${note}`; }
+  }
   record.evidence.evidence.push(evidence);
   record.evidence.queries.push({ id, purpose, tool: tool ?? "", status, elapsedMs: Date.now()-before, rowCount: rows.length,
     resultBytes: rows.length ? Buffer.byteLength(JSON.stringify(rows)) : 0, cacheHit: false, note,

@@ -135,9 +135,11 @@ test("ingestion tables upgrade an existing database without losing settings and 
   let migrated;
   try {
     migrated = first.getSettings();
-    const { queryPlans, ...preserved } = migrated;
+    const { queryPlans, mcpDictionary, ...preserved } = migrated;
     assert.deepEqual(preserved, settings);
     assert.equal(queryPlans.length, 2);
+    assert.equal(mcpDictionary.length, 5);
+    assert.ok(mcpDictionary.every((entry) => entry.validation.status === "unverified" && !entry.tool));
     first.commitIngestion("n9e", [row], state(3000));
     first.putIngestionState("n9e", {
       ...state(3000), attemptAt: 4000, status: "failed", note: "暂时不可用",

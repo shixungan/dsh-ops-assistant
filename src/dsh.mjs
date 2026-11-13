@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createQueryRuntime } from "./query-runtime.mjs";
+import { compileDictionaryQuery, assertDictionaryArguments, dictionaryFingerprint, validateDictionaryRows } from "./dictionary-query.mjs";
+import { parseEvidenceRows } from "./query-evidence.mjs";
 
 // rc.5 durable assistant/message stream contract. Do not collect reasoning or
 // provisional stream deltas; only the final committed assistant message is used.
@@ -150,6 +152,61 @@ export function createDshAnalyzer(ctx, options = {}) {
       record.failed = true;
       throw error;
     } finally {
+      record.active = false;
+    }
+  };
+  analyze.validateDictionary = async (entry, { workspace, agentPreset, sample = {} }, inputSignal) => {
+    const started = Date.now(), control = new AbortController();
+    const signal = inputSignal ? AbortSignal.any([inputSignal, control.signal]) : control.signal;
+    const record = { sessionId: null, active: true, context: { title: `MCP字典验证 · ${entry.name}`, toolCallsUsed: 0 } };
+    let fingerprint = "", timer;
+    try {
+      signal.throwIfAborted();
+      if (typeof workspace !== "string" || !workspace.trim()) throw new Error("请选择字典验证工作目录");
+      let args = compileDictionaryQuery(entry, sample, { validation: true });
+      // This manual operation never submits a model prompt. Its separately named
+      // session keeps the normal DSH policy/audit context for the bounded query.
+      const task = { workspace, agentPreset, dictionaryValidationEntry: entry, queryPlan: { maxSupplementaryCalls: 0 } };
+      timer = setTimeout(() => control.abort(new Error("字典验证超过15秒")),15000);
+      await ensure(record, task, signal);
+      const tool = record.queries.schemas.find((t) => t.name === entry.tool);
+      args = compileDictionaryQuery(entry, sample, { validation: true, tool });
+      assertDictionaryArguments(entry, tool, args);
+      fingerprint = dictionaryFingerprint(tool);
+      const result = await record.queries.invoke(entry.tool, args, signal);
+      signal.throwIfAborted();
+      if (record.queries.stopError) throw record.queries.stopError;
+      let rows, fields;
+      if (["knowledge", "memory"].includes(entry.purpose)) {
+        const text = result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+        if (!text) rows = [];
+        else {
+          try { rows = parseEvidenceRows(result); }
+          catch {
+            let value;
+            try { value = JSON.parse(text); } catch { /* Non-JSON text is a supported search result. */ }
+            const list = value && typeof value === "object" && !Array.isArray(value)
+              ? [value.results, value.items, value.matches, value.hits].find(Array.isArray) : null;
+            if (value?.error) throw new Error("检索工具返回错误内容，未标记验证成功");
+            rows = list ? list.map((item) => item && typeof item === "object" ? item : { text: String(item) }) : (value && typeof value === "object" && !Object.keys(value).length ? [] : [{ text }]);
+          }
+        }
+        fields = rows.length ? Object.keys(rows[0]).slice(0,40) : [];
+      } else {
+        rows = parseEvidenceRows(result);
+        validateDictionaryRows(entry.purpose, rows);
+        fields = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(0,40);
+      }
+      if (rows.length > 5) throw new Error("工具返回超出5条验证样例上限，请核对数量参数与工具行为");
+      return { status: rows.length ? "verified" : "empty", toolFingerprint: fingerprint, checkedAt: Date.now(), elapsedMs: Date.now()-started,
+        rowCount: rows.length, fields, sessionId: record.sessionId,
+        message: rows.length ? "有限样例查询及必需返回字段通过；字段业务含义和历史适用性仍需核对，未保存实际返回数据。" : "查询执行成功但样例为空；尚未验证返回行字段与业务含义，运行时将继续检查。" };
+    } catch (error) {
+      return { status: "failed", toolFingerprint: fingerprint, checkedAt: Date.now(), elapsedMs: Date.now()-started, rowCount: 0, fields: [], sessionId: record.sessionId,
+        message: String(signal.aborted ? signal.reason?.message ?? "字典验证已取消" : error.message).slice(0,400) };
+    } finally {
+      clearTimeout(timer);
+      if (record.queries) { record.queries.concluded = true; record.queries.running = false; record.queries.formatOnly = true; record.queries.permits.clear(); }
       record.active = false;
     }
   };

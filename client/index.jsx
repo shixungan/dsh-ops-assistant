@@ -4,6 +4,7 @@ import { coverageWarnings } from "../src/coverage.mjs";
 import { QUERY_PLANS } from "../src/query-plan.mjs";
 import { CSS } from "./styles.js";
 import { DeliverySettings } from "./delivery-settings.jsx";
+import { DictionarySettings, DictionaryBindings, DictionaryEvidence } from "./dictionary-settings.jsx";
 export const name = "ops-assistant-ui";
 export const inject = ["slots", "connection"];
 const PANEL = "dsh-ops-assistant";
@@ -36,7 +37,7 @@ const time = (t) =>
       })
     : "—";
 const empty = {
-  config: { sources: [], tasks: [], queryPlans: [] },
+  config: { sources: [], tasks: [], queryPlans: [], mcpDictionary: [] },
   runs: [],
   deliveries: [],
   pollStatus: {},
@@ -45,11 +46,13 @@ const planNames = Object.fromEntries(QUERY_PLANS.map((plan) => [plan.id, plan.na
 const freshQueryPlan = () => ({
   id: "network-ping", version: 1, instructions: "",
   bindings: { postgres: "", neo4j: "", knowledge: "", memory: "" },
+  dictionaryBindings: { assets: "", paths: "", events: "", knowledge: "", memory: "" },
   assetCacheSeconds: 300, queryTimeoutSeconds: 15, maxSupplementaryCalls: 2,
 });
 const editQueryPlan = (value) => ({
   ...freshQueryPlan(), ...value,
   bindings: { ...freshQueryPlan().bindings, ...value?.bindings },
+  dictionaryBindings: { ...freshQueryPlan().dictionaryBindings, ...value?.dictionaryBindings },
 });
 const duration = (ms) => Number.isFinite(ms)
   ? (ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`) : "—";
@@ -69,7 +72,7 @@ const freshTask = () => ({
   sendDataOnFailure: true,
 });
 
-function QueryPlanSettings({ value, onChange, tools }) {
+function QueryPlanSettings({ value, onChange, tools, dictionary }) {
   const plan = editQueryPlan(value);
   const set = (key, next) => onChange({ ...plan, [key]: next });
   const roles = [
@@ -97,6 +100,9 @@ function QueryPlanSettings({ value, onChange, tools }) {
       <details><summary>查看内置排查步骤</summary>
         <pre className="ops-report">{QUERY_PLANS.find((item) => item.id === plan.id)?.instructions}</pre>
       </details>
+      <DictionaryBindings value={plan.dictionaryBindings} entries={dictionary}
+        onChange={(next) => set("dictionaryBindings", next)} />
+      <h3>内置模板的 MCP 绑定</h3><small>仅用于未选择字典条目的用途。</small>
       <div className="ops-form-grid">
         {roles.map(([role, title, hint]) => {
           const candidates = tools.filter((tool) => tool.roles?.includes(role));
@@ -148,6 +154,7 @@ function QueryEvidence({ value, runId, onDownload }) {
         <small>取证耗时 {duration(value.elapsedMs)} · {queries.length} 条查询记录 · 缓存命中 {queries.filter((q) => q.cacheHit).length} 次</small>
         <Button onClick={() => onDownload(JSON.stringify(value, null, 2), `查询证据-${runId}.json`, "application/json")}>导出查询证据</Button>
       </div>
+      <DictionaryEvidence value={value.dictionary} />
       {queries.length ? <div className="ops-table-wrap"><table>
         <thead><tr><th>查询用途 / 工具</th><th>状态</th><th>耗时</th><th>返回条数 / 大小</th><th>说明</th></tr></thead>
         <tbody>{queries.map((query, index) => <tr key={`${query.id ?? "query"}-${index}`}>
@@ -623,6 +630,7 @@ export function OpsPanel({ call }) {
         {[
           ["overview", "运行概览"],
           ["sources", "告警接入"],
+          ["dictionary", "MCP 数据字典"],
           ["plans", "查询方案"],
           ["tasks", "巡检任务"],
           ["reports", "分析报告"],
@@ -797,6 +805,9 @@ export function OpsPanel({ call }) {
           {!queryPlans.length && <Empty>先新建一个查询方案，再在巡检任务中选择它。</Empty>}
         </section>
       )}
+      {tab === "dictionary" && <DictionarySettings entries={state.config.mcpDictionary ?? []}
+        plans={queryPlans} call={call} workspace={state.config.tasks[0]?.workspace}
+        onChanged={async () => { stateEpoch.current++; await refresh(); }} />}
       {tab === "tasks" && (
         <section className="ops-section">
           <div className="ops-section-title">
@@ -1212,7 +1223,7 @@ export function OpsPanel({ call }) {
                 ? `：${planReferences(planDraft.id).map((item) => item.name).join("、")}` : ""}。
               <small>保存后影响这些任务的后续新批次；排队、执行中的巡检和旧报告保留各自快照。</small>
             </div>}
-            <QueryPlanSettings value={planDraft.config} tools={tools}
+            <QueryPlanSettings value={planDraft.config} tools={tools} dictionary={state.config.mcpDictionary ?? []}
               onChange={(config) => setPlanDraft((value) => ({ ...value, config }))} />
             <div className="ops-sticky-footer"><button className="ops-button ops-primary" disabled={busy}>保存方案</button></div>
           </form>

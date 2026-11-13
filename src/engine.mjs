@@ -51,10 +51,11 @@ export class Engine {
     }
     const existing = this.store.window(task.id, start, end);
     if (existing) return existing;
+    const settings = this.store.getSettings();
     const run = {
       id: randomUUID(),
       taskId: task.id,
-      task: freezeTaskQueryPlan(task, this.store.getSettings().queryPlans),
+      task: freezeTaskQueryPlan(task, settings.queryPlans, settings.mcpDictionary),
       start,
       end,
       rolling,

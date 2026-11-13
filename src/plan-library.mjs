@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { QUERY_PLANS, normalizeQueryPlan } from "./query-plan.mjs";
+import { freezeDictionary } from "./mcp-dictionary.mjs";
 
 export const DEFAULT_QUERY_PLAN_ID = "builtin-network-ping";
 
@@ -65,11 +66,12 @@ export function queryPlanEntry(input, existing, { now = Date.now() } = {}) {
   };
 }
 
-export function freezeTaskQueryPlan(task, plans) {
+export function freezeTaskQueryPlan(task, plans, dictionary = []) {
   const plan = plans.find((item) => item.id === task.queryPlanId);
   if (!plan) throw new Error("任务引用的查询方案不存在，请重新选择");
   const snapshot = structuredClone(task);
   snapshot.queryPlan = normalizeQueryPlan(plan.config);
   snapshot.queryPlanRef = { id: plan.id, name: plan.name, revision: plan.revision };
+  snapshot.queryDictionary = freezeDictionary(snapshot.queryPlan, dictionary);
   return snapshot;
 }
